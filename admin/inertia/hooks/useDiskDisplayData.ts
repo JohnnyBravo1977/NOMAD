@@ -61,11 +61,21 @@ export function getPrimaryDiskInfo(
 ): { totalSize: number; totalUsed: number } | null {
   const validDisks = disks?.filter((d) => d.totalSize > 0) || []
   if (validDisks.length > 0) {
-    const diskWithRoot = validDisks.find((d) =>
-      d.filesystems?.some((fs) => fs.mount === '/' || fs.mount === '/storage')
-    )
+    const preferredMounts = [
+      '/data/project-nomad/storage',
+      '/data/project-nomad',
+      '/data',
+      '/storage',
+      '/',
+    ]
+
     const primary =
-      diskWithRoot || validDisks.reduce((a, b) => (b.totalSize > a.totalSize ? b : a))
+      preferredMounts
+        .map((mount) =>
+          validDisks.find((d) => d.filesystems?.some((fs) => fs.mount === mount))
+        )
+        .find(Boolean) ||
+      validDisks.reduce((a, b) => (b.totalSize > a.totalSize ? b : a))
     return { totalSize: primary.totalSize, totalUsed: primary.totalUsed }
   }
 
