@@ -11,6 +11,8 @@ import type { HttpContext } from '@adonisjs/core/http'
 import { DEFAULT_QUERY_REWRITE_MODEL, RAG_CONTEXT_LIMITS, SYSTEM_PROMPTS } from '../../constants/ollama.js'
 import { SERVICE_NAMES } from '../../constants/service_names.js'
 import logger from '@adonisjs/core/services/logger'
+import { appendFile, mkdir } from 'fs/promises'
+import path from 'node:path'
 type Message = { role: 'system' | 'user' | 'assistant'; content: string }
 
 @inject()
@@ -140,6 +142,16 @@ export default class OllamaController {
 
       // Separate sessionId from the Ollama request payload — Ollama rejects unknown fields
       const { sessionId, ...ollamaRequest } = reqData
+
+      // Optional prompt logging for debugging performance issues
+      await this.logPromptIfEnabled({
+        timestamp: new Date().toISOString(),
+        model: reqData.model,
+        sessionId: sessionId ?? null,
+        think,
+        numCtx: numCtx ?? null,
+        messages: reqData.messages,
+      })
 
       // Save user message to DB before streaming if sessionId provided
       let userContent: string | null = null
@@ -381,6 +393,24 @@ export default class OllamaController {
       // Fallback to last user message if rewriting fails
       const lastUserMessage = [...messages].reverse().find(msg => msg.role === 'user')
       return lastUserMessage?.content || null
+    }
+  }
+
+  private async logPromptIfEnabled(payload: {
+    timestamp: string
+    model: string
+    sessionId: number | null
+    think: boolean | 'medium'
+    numCtx: number | null
+    messages: Message[]
+  }) {
+    if (!process.env.NOMAD_PROMPT_LOG) return
+    try {
+      const logPath = path.join(process.cwd(), 'storage', 'logs', 'prompt.log')
+      await mkdir(path.dirname(logPath), { recursive: true })
+      await appendFile(logPath, JSON.stringify(payload) + '\n', 'utf-8')
+    } catch (err: any) {
+      logger.error(`[OllamaController] Failed to write prompt log: ${err?.message || err}`)
     }
   }
 }
