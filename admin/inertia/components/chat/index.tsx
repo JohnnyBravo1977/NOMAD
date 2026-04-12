@@ -34,6 +34,13 @@ export default function Chat({
   const [selectedModel, setSelectedModel] = useState<string>('')
   const [isStreamingResponse, setIsStreamingResponse] = useState(false)
   const streamAbortRef = useRef<AbortController | null>(null)
+  const [thinkingEnabled, setThinkingEnabled] = useState(() => {
+    try {
+      return localStorage.getItem('nomad:chat-thinking-enabled') === 'true'
+    } catch {
+      return false
+    }
+  })
 
   // Fetch all sessions
   const { data: sessions = [] } = useQuery({
@@ -149,6 +156,12 @@ export default function Chat({
       api.updateSetting('chat.lastModel', selectedModel)
     }
   }, [selectedModel])
+  // Persist thinking toggle
+  useEffect(() => {
+    try {
+      localStorage.setItem('nomad:chat-thinking-enabled', String(thinkingEnabled))
+    } catch {}
+  }, [thinkingEnabled])
 
   const handleNewChat = useCallback(() => {
     // Just clear the active session and messages - don't create a session yet
@@ -253,7 +266,13 @@ export default function Chat({
 
         try {
           await api.streamChatMessage(
-            { model: selectedModel || 'llama3.2', messages: chatMessages, stream: true, sessionId: sessionId ? Number(sessionId) : undefined },
+            {
+              model: selectedModel || 'llama3.2',
+              messages: chatMessages,
+              stream: true,
+              think: thinkingEnabled ? true : undefined,
+              sessionId: sessionId ? Number(sessionId) : undefined,
+            },
             (chunkContent, chunkThinking, done) => {
               if (chunkThinking.length > 0 && thinkingStartTime === null) {
                 thinkingStartTime = Date.now()
@@ -343,11 +362,12 @@ export default function Chat({
         chatMutation.mutate({
           model: selectedModel || 'llama3.2',
           messages: chatMessages,
+          think: thinkingEnabled ? true : undefined,
           sessionId: sessionId ? Number(sessionId) : undefined,
         })
       }
     },
-    [activeSessionId, messages, selectedModel, chatMutation, queryClient, streamingEnabled]
+    [activeSessionId, messages, selectedModel, chatMutation, queryClient, streamingEnabled, thinkingEnabled]
   )
 
   return (
@@ -383,6 +403,28 @@ export default function Chat({
                 {remoteStatus?.connected === false ? 'Remote Disconnected' : 'Remote Connected'}
               </span>
             )}
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-text-secondary">Thinking</span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={thinkingEnabled}
+                onClick={() => setThinkingEnabled(!thinkingEnabled)}
+                className={classNames(
+                  'relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent',
+                  'transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-desert-green focus:ring-offset-2',
+                  thinkingEnabled ? 'bg-desert-green' : 'bg-border-default'
+                )}
+              >
+                <span
+                  className={classNames(
+                    'pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0',
+                    'transition duration-200 ease-in-out',
+                    thinkingEnabled ? 'translate-x-4' : 'translate-x-0'
+                  )}
+                />
+              </button>
+            </div>
             <div className="flex items-center gap-2">
               <label htmlFor="model-select" className="text-sm text-text-secondary">
                 Model:
