@@ -64,7 +64,8 @@ export default class OllamaController {
       const rewrittenQuery = await this.rewriteQueryWithContext(reqData.messages)
 
       logger.debug(`[OllamaController] Rewritten query for RAG: "${rewrittenQuery}"`)
-      if (rewrittenQuery) {
+      // Skip RAG for very short or low-signal queries to avoid bloating the prompt.
+      if (rewrittenQuery && rewrittenQuery.trim().length >= 20) {
         const relevantDocs = await this.ragService.searchSimilarDocuments(
           rewrittenQuery,
           5, // Top 5 most relevant chunks
@@ -128,13 +129,6 @@ export default class OllamaController {
       const thinkingCapability = await this.ollamaService.checkModelHasThinking(reqData.model)
       let think: boolean | 'medium' = false
       if (reqData.think === true) {
-        think = thinkingCapability
-          ? (reqData.model.startsWith('gpt-oss') ? 'medium' : true)
-          : false
-      } else if (reqData.think === false) {
-        think = false
-      } else {
-        // Default behavior: enable thinking if the model supports it
         think = thinkingCapability
           ? (reqData.model.startsWith('gpt-oss') ? 'medium' : true)
           : false
