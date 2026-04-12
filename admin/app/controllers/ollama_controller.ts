@@ -124,7 +124,19 @@ export default class OllamaController {
       // Check if the model supports "thinking" capability for enhanced response generation
       // If gpt-oss model, it requires a text param for "think" https://docs.ollama.com/api/chat
       const thinkingCapability = await this.ollamaService.checkModelHasThinking(reqData.model)
-      const think: boolean | 'medium' = thinkingCapability ? (reqData.model.startsWith('gpt-oss') ? 'medium' : true) : false
+      let think: boolean | 'medium' = false
+      if (reqData.think === true) {
+        think = thinkingCapability
+          ? (reqData.model.startsWith('gpt-oss') ? 'medium' : true)
+          : false
+      } else if (reqData.think === false) {
+        think = false
+      } else {
+        // Default behavior: enable thinking if the model supports it
+        think = thinkingCapability
+          ? (reqData.model.startsWith('gpt-oss') ? 'medium' : true)
+          : false
+      }
 
       // Separate sessionId from the Ollama request payload — Ollama rejects unknown fields
       const { sessionId, ...ollamaRequest } = reqData
