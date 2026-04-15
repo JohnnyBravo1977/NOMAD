@@ -9,7 +9,7 @@ export default class ServiceSeeder extends BaseSeeder {
   // Use environment variable with fallback to production default
   private static NOMAD_STORAGE_ABS_PATH = env.get(
     'NOMAD_STORAGE_PATH',
-    '/opt/project-nomad/storage'
+    '/data/project-nomad/managed-storage'
   )
   private static DEFAULT_SERVICES: Omit<
     ModelAttributes<Service>,
