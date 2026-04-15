@@ -7,6 +7,7 @@ import { ChatService } from '#services/chat_service'
 import { OllamaService } from '#services/ollama_service'
 import { EditWorkerService } from '#services/edit_worker_service'
 import { ReadWorkerService } from '#services/read_worker_service'
+import { SystemWorkerService } from '#services/system_worker_service'
 import { appendFile, mkdir, writeFile } from 'fs/promises'
 import logger from '@adonisjs/core/services/logger'
 import { DEFAULT_QUERY_REWRITE_MODEL, RAG_CONTEXT_LIMITS, SYSTEM_PROMPTS } from '../../constants/ollama.js'
@@ -111,7 +112,8 @@ export class ChatOrchestratorService {
     private chatService: ChatService,
     private ollamaService: OllamaService,
     private editWorkerService: EditWorkerService,
-    private readWorkerService: ReadWorkerService
+    private readWorkerService: ReadWorkerService,
+    private systemWorkerService: SystemWorkerService
   ) {}
 
   getContextLimitsForModel(modelName: string): { maxResults: number; maxTokens: number } {
@@ -525,6 +527,11 @@ export class ChatOrchestratorService {
   }): Promise<DirectAnswerPlan> {
     const { lastUserText, profiles, activeUser, userName, ragService } = args
     try {
+      const systemWorkerAnswer = await this.systemWorkerService.tryHandle(lastUserText)
+      if (systemWorkerAnswer) {
+        return { content: systemWorkerAnswer }
+      }
+
       const editWorkerAnswer = await this.editWorkerService.tryHandle(lastUserText)
       if (editWorkerAnswer) {
         return { content: editWorkerAnswer }
