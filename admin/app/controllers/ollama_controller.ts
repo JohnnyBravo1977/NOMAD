@@ -57,124 +57,21 @@ export default class OllamaController {
     }
 
     try {
-      const preparedTurn = await this.chatOrchestratorService.prepareChatTurn({
+      const chatResult = await this.chatOrchestratorService.runChatTurn({
         requestData: reqData,
         ragService: this.ragService,
-      })
-      const {
-        messages,
-        sessionId,
-        ollamaRequest,
-        lastUserText,
-        rewriteMs,
-        ragMs,
-        ragDocsCount,
-        think,
-        numCtx,
-        keepAlive,
-        maxTokens,
-        directAnswer,
-      } = preparedTurn
-
-      if (directAnswer) {
-        const userContent = await this.chatOrchestratorService.saveUserMessage(sessionId, messages)
-        await this.chatOrchestratorService.saveAssistantReply({
-          sessionId,
-          userContent,
-          assistantContent: directAnswer.content,
-        })
-        if (reqData.stream) {
-          response.response.write(`data: ${JSON.stringify({ message: { content: directAnswer.content }, done: true })}\n\n`)
-          response.response.end()
-          return
-        }
-        return { message: { content: directAnswer.content }, done: true, model: reqData.model }
-      }
-
-      // Optional prompt logging for debugging performance issues
-      await this.chatOrchestratorService.logPromptIfEnabled({
-        timestamp: new Date().toISOString(),
-        model: reqData.model,
-        sessionId: sessionId ?? null,
-        think,
-        numCtx: numCtx ?? null,
-        messages,
+        perfStart,
+        onStreamChunk: async (chunk) => {
+          response.response.write(`data: ${JSON.stringify(chunk)}\n\n`)
+        },
       })
 
-      // Save user message to DB before streaming if sessionId provided
-      const userContent = await this.chatOrchestratorService.saveUserMessage(sessionId, messages)
-
-      if (reqData.stream) {
-        logger.debug(`[OllamaController] Initiating streaming response for model: "${reqData.model}" with think: ${think}`)
-        const streamResult = await this.chatOrchestratorService.executeStreamingChat({
-          ...ollamaRequest,
-          think,
-          numCtx,
-          keepAlive,
-          maxTokens,
-          onChunk: async (chunk) => {
-            response.response.write(`data: ${JSON.stringify(chunk)}\n\n`)
-          },
-        })
+      if (chatResult.kind === 'stream') {
         response.response.end()
-
-        await this.chatOrchestratorService.saveAssistantReply({
-          sessionId: sessionId ?? null,
-          userContent,
-          assistantContent: streamResult.fullContent,
-        })
-        const perfPayload = {
-          timestamp: new Date().toISOString(),
-          model: reqData.model,
-          sessionId: sessionId ?? null,
-          stream: true,
-          think,
-          numCtx: numCtx ?? null,
-          messageLength: lastUserText.length,
-          rewriteMs,
-          ragMs,
-          ragDocsCount,
-          ttfbMs: streamResult.ttfbMs,
-          totalMs: Date.now() - perfStart,
-          chatMs: streamResult.chatMs,
-        }
-        console.log('[ChatPerf]', JSON.stringify(perfPayload))
-        await this.chatOrchestratorService.logChatPerfIfEnabled(perfPayload)
         return
       }
 
-      const { result, chatMs } = await this.chatOrchestratorService.executeChat({
-        ...ollamaRequest,
-        think,
-        numCtx,
-        keepAlive,
-        maxTokens,
-      })
-
-      await this.chatOrchestratorService.saveAssistantReply({
-        sessionId: sessionId ?? null,
-        userContent,
-        assistantContent: result?.message?.content || '',
-      })
-
-      const perfPayload = {
-        timestamp: new Date().toISOString(),
-        model: reqData.model,
-        sessionId: sessionId ?? null,
-        stream: false,
-        think,
-        numCtx: numCtx ?? null,
-        messageLength: lastUserText.length,
-        rewriteMs,
-        ragMs,
-        ragDocsCount,
-        ttfbMs: null,
-        totalMs: Date.now() - perfStart,
-        chatMs,
-      }
-      console.log('[ChatPerf]', JSON.stringify(perfPayload))
-      await this.chatOrchestratorService.logChatPerfIfEnabled(perfPayload)
-      return result
+      return chatResult.body
     } catch (error) {
       if (reqData.stream) {
         response.response.write(`data: ${JSON.stringify({ error: true })}\n\n`)

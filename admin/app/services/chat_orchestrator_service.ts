@@ -94,6 +94,15 @@ type PreparedChatTurn = {
   directAnswer: DirectAnswerPlan
 }
 
+type ChatTurnResult =
+  | {
+      kind: 'stream'
+    }
+  | {
+      kind: 'json'
+      body: any
+    }
+
 @inject()
 export class ChatOrchestratorService {
   constructor(
@@ -260,6 +269,137 @@ export class ChatOrchestratorService {
       maxTokens,
       directAnswer,
     }
+  }
+
+  async runChatTurn(args: {
+    requestData: ChatRequestInput
+    ragService: RagService
+    perfStart: number
+    onStreamChunk?: (chunk: StreamChunk | { message: { content: string }; done: true }) => void | Promise<void>
+  }): Promise<ChatTurnResult> {
+    const { requestData, ragService, perfStart, onStreamChunk } = args
+    const preparedTurn = await this.prepareChatTurn({
+      requestData,
+      ragService,
+    })
+
+    const {
+      messages,
+      sessionId,
+      ollamaRequest,
+      lastUserText,
+      rewriteMs,
+      ragMs,
+      ragDocsCount,
+      think,
+      numCtx,
+      keepAlive,
+      maxTokens,
+      directAnswer,
+    } = preparedTurn
+
+    if (directAnswer) {
+      const userContent = await this.saveUserMessage(sessionId, messages)
+      await this.saveAssistantReply({
+        sessionId,
+        userContent,
+        assistantContent: directAnswer.content,
+      })
+
+      if (requestData.stream) {
+        await onStreamChunk?.({ message: { content: directAnswer.content }, done: true })
+        return { kind: 'stream' }
+      }
+
+      return {
+        kind: 'json',
+        body: { message: { content: directAnswer.content }, done: true, model: requestData.model },
+      }
+    }
+
+    await this.logPromptIfEnabled({
+      timestamp: new Date().toISOString(),
+      model: requestData.model,
+      sessionId,
+      think,
+      numCtx: numCtx ?? null,
+      messages,
+    })
+
+    const userContent = await this.saveUserMessage(sessionId, messages)
+
+    if (requestData.stream) {
+      logger.debug(
+        `[ChatOrchestratorService] Initiating streaming response for model: "${requestData.model}" with think: ${think}`
+      )
+      const streamResult = await this.executeStreamingChat({
+        ...ollamaRequest,
+        think,
+        numCtx,
+        keepAlive,
+        maxTokens,
+        onChunk: async (chunk) => {
+          await onStreamChunk?.(chunk)
+        },
+      })
+
+      await this.saveAssistantReply({
+        sessionId,
+        userContent,
+        assistantContent: streamResult.fullContent,
+      })
+      const perfPayload = {
+        timestamp: new Date().toISOString(),
+        model: requestData.model,
+        sessionId,
+        stream: true,
+        think,
+        numCtx: numCtx ?? null,
+        messageLength: lastUserText.length,
+        rewriteMs,
+        ragMs,
+        ragDocsCount,
+        ttfbMs: streamResult.ttfbMs,
+        totalMs: Date.now() - perfStart,
+        chatMs: streamResult.chatMs,
+      }
+      console.log('[ChatPerf]', JSON.stringify(perfPayload))
+      await this.logChatPerfIfEnabled(perfPayload)
+      return { kind: 'stream' }
+    }
+
+    const { result, chatMs } = await this.executeChat({
+      ...ollamaRequest,
+      think,
+      numCtx,
+      keepAlive,
+      maxTokens,
+    })
+
+    await this.saveAssistantReply({
+      sessionId,
+      userContent,
+      assistantContent: result?.message?.content || '',
+    })
+
+    const perfPayload = {
+      timestamp: new Date().toISOString(),
+      model: requestData.model,
+      sessionId,
+      stream: false,
+      think,
+      numCtx: numCtx ?? null,
+      messageLength: lastUserText.length,
+      rewriteMs,
+      ragMs,
+      ragDocsCount,
+      ttfbMs: null,
+      totalMs: Date.now() - perfStart,
+      chatMs,
+    }
+    console.log('[ChatPerf]', JSON.stringify(perfPayload))
+    await this.logChatPerfIfEnabled(perfPayload)
+    return { kind: 'json', body: result }
   }
 
   async preparePersonalization(args: {
