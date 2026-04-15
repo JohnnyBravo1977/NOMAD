@@ -6,9 +6,19 @@ type HaTask =
   | { kind: 'get_state'; entityRef: string }
   | { kind: 'call_service'; domain: string; service: string; data: Record<string, any> }
 
+type HaState = {
+  entity_id: string
+  state: string
+  attributes?: Record<string, any>
+}
+
 @inject()
 export class HomeAssistantWorkerService {
   constructor(private homeAssistantService: HomeAssistantService) {}
+
+  private isEntityId(value: string): boolean {
+    return /^[a-z0-9_]+\.[a-z0-9_]+$/i.test(value.trim())
+  }
 
   async tryHandle(userText: string): Promise<string | null> {
     const task = this.parseTask(userText)
@@ -57,6 +67,14 @@ export class HomeAssistantWorkerService {
       return { kind: 'get_state', entityRef: match[1].toLowerCase() }
     }
 
+    match =
+      text.match(/\b(?:state|status) of (.+)\b/i) ||
+      text.match(/\bwhat(?:'s| is) the state of (.+)\b/i) ||
+      text.match(/\bwhat(?:'s| is) the status of (.+)\b/i)
+    if (match) {
+      return { kind: 'get_state', entityRef: this.cleanEntityReference(match[1]) }
+    }
+
     match = text.match(/\b(?:turn on|turn off|lock|unlock)\s+([a-z0-9_]+\.[a-z0-9_]+)\b/i)
     if (match) {
       const entityId = match[1].toLowerCase()
@@ -95,6 +113,25 @@ export class HomeAssistantWorkerService {
       }
     }
 
+    match = text.match(/\b(turn on|turn off|lock|unlock)\s+(.+)\b/i)
+    if (match) {
+      const action = match[1].toLowerCase()
+      const target = this.cleanEntityReference(match[2])
+      if (!target) return null
+      if (action === 'turn on') {
+        return { kind: 'call_service', domain: 'homeassistant', service: 'turn_on', data: { entity_ref: target } }
+      }
+      if (action === 'turn off') {
+        return { kind: 'call_service', domain: 'homeassistant', service: 'turn_off', data: { entity_ref: target } }
+      }
+      if (action === 'lock') {
+        return { kind: 'call_service', domain: 'lock', service: 'lock', data: { entity_ref: target } }
+      }
+      if (action === 'unlock') {
+        return { kind: 'call_service', domain: 'lock', service: 'unlock', data: { entity_ref: target } }
+      }
+    }
+
     return null
   }
 
@@ -113,27 +150,22 @@ export class HomeAssistantWorkerService {
   }
 
   private async getEntityState(entityRef: string): Promise<string> {
-    const state = await this.homeAssistantService.getState(entityRef)
+    const state = await this.findBestEntityMatch(entityRef)
     if (state) {
       return this.describeState(state)
     }
-
-    const states = await this.homeAssistantService.getStates()
-    const fallback = states.find(
-      (item) =>
-        item.entity_id.toLowerCase() === entityRef.toLowerCase() ||
-        item.entity_id.toLowerCase().endsWith(`.${entityRef.toLowerCase()}`)
-    )
-    if (!fallback) {
-      return `I couldn't find a Home Assistant entity matching ${entityRef}.`
-    }
-
-    return this.describeState(fallback)
+    return `I couldn't find a Home Assistant entity matching ${entityRef}.`
   }
 
   private async callService(domain: string, service: string, data: Record<string, any>): Promise<string> {
-    await this.homeAssistantService.callService(domain, service, data)
-    const entityId = typeof data.entity_id === 'string' ? data.entity_id : null
+    const entityId = await this.resolveEntityIdForService(domain, data)
+    const serviceData = { ...data }
+    delete serviceData.entity_ref
+    if (entityId) {
+      serviceData.entity_id = entityId
+    }
+
+    await this.homeAssistantService.callService(domain, service, serviceData)
     if (!entityId) {
       return `Home Assistant service ${domain}.${service} completed.`
     }
@@ -156,5 +188,109 @@ export class HomeAssistantWorkerService {
       parts.push(`current_temperature=${state.attributes.current_temperature}`)
     }
     return parts.join('\n')
+  }
+
+  private cleanEntityReference(value: string): string {
+    return value
+      .trim()
+      .replace(/[?.!,]+$/g, '')
+      .replace(/^(?:the|a|an)\s+/i, '')
+      .replace(/\s+(?:please|for me)$/i, '')
+      .trim()
+  }
+
+  private normalizeText(value: string): string {
+    return value
+      .toLowerCase()
+      .replace(/[_./-]+/g, ' ')
+      .replace(/\b(the|a|an|my)\b/g, ' ')
+      .replace(/\b(lights)\b/g, 'light')
+      .replace(/\b(doors)\b/g, 'door')
+      .replace(/\b(locks)\b/g, 'lock')
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+
+  private async resolveEntityIdForService(domain: string, data: Record<string, any>): Promise<string | null> {
+    if (typeof data.entity_id === 'string') {
+      return data.entity_id
+    }
+
+    const entityRef = typeof data.entity_ref === 'string' ? data.entity_ref : null
+    if (!entityRef) return null
+
+    const domainHints =
+      domain === 'lock'
+        ? ['lock']
+        : domain === 'homeassistant'
+          ? ['light', 'switch', 'fan', 'cover', 'script', 'scene', 'input_boolean']
+          : [domain]
+
+    const match = await this.findBestEntityMatch(entityRef, domainHints)
+    if (!match) {
+      throw new Error(`I couldn't find a Home Assistant entity matching ${entityRef}.`)
+    }
+
+    return match.entity_id
+  }
+
+  private async findBestEntityMatch(entityRef: string, domainHints?: string[]): Promise<HaState | null> {
+    if (this.isEntityId(entityRef)) {
+      try {
+        const direct = await this.homeAssistantService.getState(entityRef)
+        if (direct) return direct
+      } catch {
+        // Fall back to friendly-name matching below.
+      }
+    }
+
+    const states = await this.homeAssistantService.getStates()
+    const normalizedNeedle = this.normalizeText(entityRef)
+    if (!normalizedNeedle) return null
+
+    const filteredStates = domainHints?.length
+      ? states.filter((state) => domainHints.includes(state.entity_id.split('.')[0]))
+      : states
+
+    let best: { state: HaState; score: number } | null = null
+    for (const state of filteredStates) {
+      const score = this.scoreEntityMatch(state, normalizedNeedle)
+      if (score <= 0) continue
+      if (!best || score > best.score) {
+        best = { state, score }
+      }
+    }
+
+    return best?.state || null
+  }
+
+  private scoreEntityMatch(state: HaState, normalizedNeedle: string): number {
+    const entityId = state.entity_id.toLowerCase()
+    const friendlyName =
+      typeof state.attributes?.friendly_name === 'string' ? state.attributes.friendly_name : ''
+    const normalizedEntityId = this.normalizeText(entityId)
+    const normalizedFriendlyName = this.normalizeText(friendlyName)
+    const haystacks = [normalizedEntityId, normalizedFriendlyName].filter(Boolean)
+
+    if (haystacks.includes(normalizedNeedle)) return 100
+    if (haystacks.some((haystack) => haystack.endsWith(normalizedNeedle))) return 90
+    if (haystacks.some((haystack) => haystack.includes(normalizedNeedle))) return 80
+
+    const needleTokens = normalizedNeedle.split(' ').filter(Boolean)
+    if (!needleTokens.length) return 0
+
+    let bestScore = 0
+    for (const haystack of haystacks) {
+      const haystackTokens = new Set(haystack.split(' ').filter(Boolean))
+      const matchedTokens = needleTokens.filter((token) => haystackTokens.has(token)).length
+      if (!matchedTokens) continue
+
+      const score = matchedTokens === needleTokens.length ? 70 : matchedTokens * 10
+      if (score > bestScore) {
+        bestScore = score
+      }
+    }
+
+    return bestScore
   }
 }
