@@ -30,7 +30,7 @@ export default function ModelsPage(props: {
   }
 }) {
   const { aiAssistantName } = usePage<{ aiAssistantName: string }>().props
-  const { isInstalled } = useServiceInstalledStatus(SERVICE_NAMES.OLLAMA)
+  const { isInstalled, loading: isInstallStatusLoading } = useServiceInstalledStatus(SERVICE_NAMES.OLLAMA)
   const { addNotification } = useNotifications()
   const { openModal, closeAllModals } = useModals()
   const { debounce } = useDebounce()
@@ -183,10 +183,15 @@ export default function ModelsPage(props: {
   async function handleInstallModel(modelName: string) {
     try {
       const res = await api.downloadModel(modelName)
-      if (res.success) {
+      if (res?.success) {
         addNotification({
           message: `Model download initiated for ${modelName}. It may take some time to complete.`,
           type: 'success',
+        })
+      } else {
+        addNotification({
+          message: res?.message || `Failed to queue model download for ${modelName}.`,
+          type: 'error',
         })
       }
     } catch (error) {
@@ -270,7 +275,7 @@ export default function ModelsPage(props: {
             starting with smaller models first to see how they perform on your system before moving
             on to larger ones.
           </p>
-          {!isInstalled && (
+          {!isInstallStatusLoading && !isInstalled && (
             <Alert
               title={`${aiAssistantName}'s dependencies are not installed. Please install them to manage AI models.`}
               type="warning"
@@ -278,7 +283,7 @@ export default function ModelsPage(props: {
               className="!mt-6"
             />
           )}
-          {isInstalled && systemInfo?.gpuHealth?.status === 'passthrough_failed' && !gpuBannerDismissed && (
+          {!isInstallStatusLoading && isInstalled && systemInfo?.gpuHealth?.status === 'passthrough_failed' && !gpuBannerDismissed && (
             <Alert
               type="warning"
               variant="bordered"

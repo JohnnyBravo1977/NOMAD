@@ -18,7 +18,9 @@ export class DownloadModelJob {
   }
 
   static getJobId(modelName: string): string {
-    return createHash('sha256').update(modelName).digest('hex').slice(0, 16)
+    // BullMQ rejects custom job IDs that are purely numeric.
+    // Prefix the hash so every model name yields a safe, stable job ID.
+    return `model-${createHash('sha256').update(modelName).digest('hex').slice(0, 16)}`
   }
 
   async handle(job: Job) {

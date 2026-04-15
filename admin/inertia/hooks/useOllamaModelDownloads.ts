@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTransmit } from 'react-adonis-transmit'
+import useDownloads from './useDownloads'
 
 export type OllamaModelDownload = {
     model: string
@@ -12,6 +13,30 @@ export default function useOllamaModelDownloads() {
     const { subscribe } = useTransmit()
     const [downloads, setDownloads] = useState<Map<string, OllamaModelDownload>>(new Map())
     const timeoutsRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set())
+    const { data: queuedDownloads = [] } = useDownloads({ filetype: 'model' })
+
+    useEffect(() => {
+        setDownloads((prev) => {
+            const next = new Map(prev)
+
+            for (const job of queuedDownloads) {
+                const model = job.filepath || job.url
+                if (!model) continue
+
+                const existing = next.get(model)
+                const percent = Number.isFinite(job.progress) ? job.progress : 0
+
+                next.set(model, {
+                    model,
+                    percent: existing ? Math.max(existing.percent, percent) : percent,
+                    timestamp: new Date().toISOString(),
+                    error: job.status === 'failed' ? job.failedReason || 'Download failed' : undefined,
+                })
+            }
+
+            return next
+        })
+    }, [queuedDownloads])
 
     useEffect(() => {
         const unsubscribe = subscribe('ollama-model-download', (data: OllamaModelDownload) => {
@@ -58,7 +83,12 @@ export default function useOllamaModelDownloads() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [subscribe])
 
-    const downloadsArray = Array.from(downloads.values())
+    const downloadsArray = useMemo(() => {
+        return Array.from(downloads.values()).filter((download) => {
+            if (download.error) return true
+            return download.percent < 100
+        })
+    }, [downloads])
 
     return { downloads: downloadsArray, activeCount: downloads.size }
 }

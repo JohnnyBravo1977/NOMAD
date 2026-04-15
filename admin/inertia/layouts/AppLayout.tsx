@@ -36,7 +36,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
       <div className="flex-1 w-full bg-desert">{children}</div>
       <Footer />
 
-      {aiAssistantInstalled && (
+      {!aiAssistantInstalled.loading && aiAssistantInstalled.isInstalled && (
         <>
           <ChatButton onClick={() => setIsChatOpen(true)} />
           <ChatModal open={isChatOpen} onClose={() => setIsChatOpen(false)} />

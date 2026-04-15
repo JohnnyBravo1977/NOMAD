@@ -22,7 +22,7 @@ export default function SettingsLayout({ children }: { children: React.ReactNode
   const aiAssistantInstallStatus = useServiceInstalledStatus(SERVICE_NAMES.OLLAMA)
 
   const navigation = [
-    ...(aiAssistantInstallStatus.isInstalled ? [{ name: aiAssistantName, href: '/settings/models', icon: IconWand, current: false }] : []),
+    ...(!aiAssistantInstallStatus.loading && aiAssistantInstallStatus.isInstalled ? [{ name: aiAssistantName, href: '/settings/models', icon: IconWand, current: false }] : []),
     { name: 'Apps', href: '/settings/apps', icon: IconTerminal2, current: false },
     { name: 'Benchmark', href: '/settings/benchmark', icon: IconChartBar, current: false },
     { name: 'Content Explorer', href: '/settings/zim/remote-explorer', icon: IconZoom, current: false },

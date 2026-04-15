@@ -555,6 +555,12 @@ export class DockerService {
         if (flashAttentionEnabled !== false) {
           ollamaEnv.push('OLLAMA_FLASH_ATTENTION=1')
         }
+        if (process.env.NOMAD_OLLAMA_KV_CACHE_TYPE) {
+          ollamaEnv.push(`OLLAMA_KV_CACHE_TYPE=${process.env.NOMAD_OLLAMA_KV_CACHE_TYPE}`)
+        }
+        if (process.env.NOMAD_OLLAMA_MAX_QUEUE) {
+          ollamaEnv.push(`OLLAMA_MAX_QUEUE=${process.env.NOMAD_OLLAMA_MAX_QUEUE}`)
+        }
       }
 
       this._broadcast(
