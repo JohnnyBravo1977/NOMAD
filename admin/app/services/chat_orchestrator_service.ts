@@ -3,6 +3,7 @@ import env from '#start/env'
 import path from 'node:path'
 import KVStore from '#models/kv_store'
 import { RagService } from '#services/rag_service'
+import { ChatService } from '#services/chat_service'
 import { mkdir, writeFile } from 'fs/promises'
 
 type Message = { role: 'system' | 'user' | 'assistant'; content: string }
@@ -38,6 +39,8 @@ type DirectAnswerPlan = {
 
 @inject()
 export class ChatOrchestratorService {
+  constructor(private chatService: ChatService) {}
+
   async preparePersonalization(args: {
     messages: Message[]
     assistantName: string
@@ -304,7 +307,7 @@ export class ChatOrchestratorService {
     lastUserText: string
     ragDocsCount: number
   }): RuntimeSettingsPlan {
-    const { messages, model, lastUserText, ragDocsCount } = args
+    const { messages, model } = args
     const systemChars = messages
       .filter((m) => m.role === 'system')
       .reduce((sum, m) => sum + m.content.length, 0)
@@ -314,8 +317,6 @@ export class ChatOrchestratorService {
     if (estimatedSystemTokens > 3000) {
       const needed = estimatedSystemTokens + 2048
       numCtx = [8192, 16384, 32768, 65536].find((n) => n >= needed) ?? 65536
-    } else if (model === 'qwen3.5:35b-a3b-fast') {
-      numCtx = 4096
     }
 
     const keepAliveDefault = env.get('NOMAD_OLLAMA_KEEP_ALIVE')
@@ -331,12 +332,73 @@ export class ChatOrchestratorService {
           : undefined
         : keepAliveDefault
 
-    const isShortPrompt = lastUserText.length > 0 && lastUserText.length < 80
-    const maxTokens =
-      model === 'qwen3.5:35b-a3b-fast' && isShortPrompt && !ragDocsCount ? 128 : undefined
+    const maxTokens = undefined
 
     return { numCtx, keepAlive, maxTokens }
   }
+
+  async saveUserMessage(sessionId: number | null, messages: Message[]): Promise<string | null> {
+    if (!sessionId) return null
+    const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user')
+    if (!lastUserMsg) return null
+    await this.chatService.addMessage(sessionId, 'user', lastUserMsg.content)
+    return lastUserMsg.content
+  }
+
+  sanitizeAssistantContent(text: string): string {
+    return stripReasoningBlocksAll(text)
+  }
+
+  async saveAssistantReply(args: {
+    sessionId: number | null
+    userContent: string | null
+    assistantContent: string
+  }) {
+    const { sessionId, userContent, assistantContent } = args
+    if (!sessionId || !assistantContent) return
+    await this.chatService.addMessage(sessionId, 'assistant', assistantContent)
+    const messageCount = await this.chatService.getMessageCount(sessionId)
+    if (messageCount <= 2 && userContent) {
+      this.chatService.generateTitle(sessionId, userContent, assistantContent).catch((err) => {
+        console.error(
+          `[ChatOrchestratorService] Title generation failed: ${err instanceof Error ? err.message : err}`
+        )
+      })
+    }
+  }
+}
+
+function stripReasoningBlock(text: string): string {
+  const trimmed = text.trimStart()
+  if (trimmed.startsWith('```')) {
+    const fenceEnd = trimmed.indexOf('```', 3)
+    const header = trimmed.slice(3, Math.min(trimmed.length, 80)).toLowerCase()
+    if (header.includes('reason') || header.includes('thinking')) {
+      if (fenceEnd !== -1) {
+        return trimmed.slice(fenceEnd + 3).trimStart()
+      }
+    }
+  }
+  const headerMatch = trimmed.match(/^(reasoning|thinking process)\s*[:\-]*\s*/i)
+  if (headerMatch) {
+    const rest = trimmed.slice(headerMatch[0].length)
+    const blankIdx = rest.search(/\n\s*\n/)
+    if (blankIdx !== -1) {
+      return rest.slice(blankIdx).trimStart()
+    }
+    return rest.trimStart()
+  }
+  return text
+}
+
+function stripReasoningBlocksAll(text: string): string {
+  let out = text
+  for (let i = 0; i < 5; i++) {
+    const next = stripReasoningBlock(out)
+    if (next === out) break
+    out = next
+  }
+  return out
 }
 
 function formatLocalDateTime(timezone?: string): string {

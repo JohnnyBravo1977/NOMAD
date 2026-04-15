@@ -1,4 +1,3 @@
-import { ChatService } from '#services/chat_service'
 import { ChatOrchestratorService } from '#services/chat_orchestrator_service'
 import { DockerService } from '#services/docker_service'
 import { OllamaService } from '#services/ollama_service'
@@ -16,47 +15,9 @@ import { appendFile, mkdir } from 'fs/promises'
 import path from 'node:path'
 type Message = { role: 'system' | 'user' | 'assistant'; content: string }
 
-function stripReasoningBlock(text: string): string {
-  const trimmed = text.trimStart()
-  // Strip fenced code block that starts with "Reasoning" or "Thinking Process"
-  if (trimmed.startsWith('```')) {
-    const fenceEnd = trimmed.indexOf('```', 3)
-    const header = trimmed.slice(3, Math.min(trimmed.length, 80)).toLowerCase()
-    if (header.includes('reason') || header.includes('thinking')) {
-      if (fenceEnd !== -1) {
-        return trimmed.slice(fenceEnd + 3).trimStart()
-      }
-    }
-  }
-  // Strip plain "Reasoning" / "Thinking Process" header blocks
-  const headerMatch = trimmed.match(/^(reasoning|thinking process)\s*[:\-]*\s*/i)
-  if (headerMatch) {
-    const rest = trimmed.slice(headerMatch[0].length)
-    // Drop up to the first blank line (or a long chunk) if present
-    const blankIdx = rest.search(/\n\s*\n/)
-    if (blankIdx !== -1) {
-      return rest.slice(blankIdx).trimStart()
-    }
-    return rest.trimStart()
-  }
-  return text
-}
-
-function stripReasoningBlocksAll(text: string): string {
-  let out = text
-  // Strip multiple reasoning blocks if present
-  for (let i = 0; i < 5; i++) {
-    const next = stripReasoningBlock(out)
-    if (next === out) break
-    out = next
-  }
-  return out
-}
-
 @inject()
 export default class OllamaController {
   constructor(
-    private chatService: ChatService,
     private chatOrchestratorService: ChatOrchestratorService,
     private dockerService: DockerService,
     private ollamaService: OllamaService,
@@ -125,28 +86,18 @@ export default class OllamaController {
       })
       if (directAnswer) {
         const sessionId = reqData.sessionId ?? null
-        if (sessionId) {
-          const lastUserMsg = [...reqData.messages].reverse().find((m) => m.role === 'user')
-          if (lastUserMsg) {
-            await this.chatService.addMessage(sessionId, 'user', lastUserMsg.content)
-          }
-          await this.chatService.addMessage(sessionId, 'assistant', directAnswer.content)
-        }
+        const userContent = await this.chatOrchestratorService.saveUserMessage(sessionId, reqData.messages)
+        await this.chatOrchestratorService.saveAssistantReply({
+          sessionId,
+          userContent,
+          assistantContent: directAnswer.content,
+        })
         if (reqData.stream) {
           response.response.write(`data: ${JSON.stringify({ message: { content: directAnswer.content }, done: true })}\n\n`)
           response.response.end()
           return
         }
         return { message: { content: directAnswer.content }, done: true, model: reqData.model }
-      }
-
-      // For fast chat model, explicitly forbid reasoning dumps
-      if (reqData.model === 'qwen3.5:35b-a3b-fast') {
-        reqData.messages.unshift({
-          role: 'system',
-          content:
-            'Do not reveal chain-of-thought or reasoning. Respond with the final answer only. Do not wrap responses in code blocks unless the user asked for code.',
-        })
       }
 
       // Query rewriting for better RAG retrieval with manageable context
@@ -205,14 +156,7 @@ export default class OllamaController {
       })
 
       // Save user message to DB before streaming if sessionId provided
-      let userContent: string | null = null
-      if (sessionId) {
-        const lastUserMsg = [...reqData.messages].reverse().find((m) => m.role === 'user')
-        if (lastUserMsg) {
-          userContent = lastUserMsg.content
-          await this.chatService.addMessage(sessionId, 'user', userContent)
-        }
-      }
+      const userContent = await this.chatOrchestratorService.saveUserMessage(sessionId ?? null, reqData.messages)
 
       if (reqData.stream) {
         logger.debug(`[OllamaController] Initiating streaming response for model: "${reqData.model}" with think: ${think}`)
@@ -269,7 +213,7 @@ export default class OllamaController {
           }
 
           if (chunkContent) {
-            chunkContent = stripReasoningBlocksAll(chunkContent)
+            chunkContent = this.chatOrchestratorService.sanitizeAssistantContent(chunkContent)
           }
           if (chunkContent) {
             fullContent += chunkContent
@@ -287,15 +231,11 @@ export default class OllamaController {
         const chatMs = Date.now() - chatStart
 
         // Save assistant message and optionally generate title
-        if (sessionId && fullContent) {
-          await this.chatService.addMessage(sessionId, 'assistant', fullContent)
-          const messageCount = await this.chatService.getMessageCount(sessionId)
-          if (messageCount <= 2 && userContent) {
-            this.chatService.generateTitle(sessionId, userContent, fullContent).catch((err) => {
-              logger.error(`[OllamaController] Title generation failed: ${err instanceof Error ? err.message : err}`)
-            })
-          }
-        }
+        await this.chatOrchestratorService.saveAssistantReply({
+          sessionId: sessionId ?? null,
+          userContent,
+          assistantContent: fullContent,
+        })
         const perfPayload = {
           timestamp: new Date().toISOString(),
           model: reqData.model,
@@ -320,19 +260,15 @@ export default class OllamaController {
       const chatStart = Date.now()
       const result = await this.ollamaService.chat({ ...ollamaRequest, think, numCtx, keepAlive, maxTokens })
       if (result?.message?.content) {
-        result.message.content = stripReasoningBlocksAll(result.message.content)
+        result.message.content = this.chatOrchestratorService.sanitizeAssistantContent(result.message.content)
       }
       const chatMs = Date.now() - chatStart
 
-      if (sessionId && result?.message?.content) {
-        await this.chatService.addMessage(sessionId, 'assistant', result.message.content)
-        const messageCount = await this.chatService.getMessageCount(sessionId)
-        if (messageCount <= 2 && userContent) {
-          this.chatService.generateTitle(sessionId, userContent, result.message.content).catch((err) => {
-            logger.error(`[OllamaController] Title generation failed: ${err instanceof Error ? err.message : err}`)
-          })
-        }
-      }
+      await this.chatOrchestratorService.saveAssistantReply({
+        sessionId: sessionId ?? null,
+        userContent,
+        assistantContent: result?.message?.content || '',
+      })
 
       const perfPayload = {
         timestamp: new Date().toISOString(),
