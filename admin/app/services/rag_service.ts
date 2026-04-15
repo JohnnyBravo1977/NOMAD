@@ -5,6 +5,7 @@ import logger from '@adonisjs/core/services/logger'
 import { TokenChunker } from '@chonkiejs/core'
 import sharp from 'sharp'
 import { deleteFileIfExists, determineFileType, getFile, getFileStatsIfExists, listDirectoryContentsRecursive, ZIM_STORAGE_PATH } from '../utils/fs.js'
+import { doResumableDownloadWithRetry } from '../utils/downloads.js'
 import { PDFParse } from 'pdf-parse'
 import { createWorker } from 'tesseract.js'
 import { fromBuffer } from 'pdf2pic'
@@ -41,6 +42,10 @@ export class RagService {
   public static SEARCH_DOCUMENT_PREFIX = 'search_document: '
   public static SEARCH_QUERY_PREFIX = 'search_query: '
   public static EMBEDDING_BATCH_SIZE = 8 // Conservative batch size for low-end hardware
+  public static OCR_LANGUAGE = process.env.NOMAD_OCR_LANG || 'eng'
+  public static OCR_STORAGE_PATH = 'storage/ocr'
+  public static OCR_LANG_PATH = process.env.NOMAD_OCR_LANG_PATH || null
+  public static OCR_LANG_DATA_URL = process.env.NOMAD_OCR_LANG_DATA_URL || null
 
   constructor(
     private dockerService: DockerService,
@@ -64,6 +69,15 @@ export class RagService {
     if (!this.qdrant) {
       await this._initializeQdrantClient()
     }
+  }
+
+  private shouldSkipEmbeddingFile(filepath: string): boolean {
+    const normalized = filepath.toLowerCase()
+    // Kiwix library metadata is not user knowledge content and should never be embedded.
+    if (normalized.endsWith('/kiwix-library.xml') || normalized.endsWith('\\kiwix-library.xml')) {
+      return true
+    }
+    return false
   }
 
   private async _ensureCollection(
@@ -158,6 +172,30 @@ export class RagService {
 
     logger.warn(
       `[RAG] Truncated text from ${text.length} to ${truncated.length} chars (est. ${estimatedTokens} → ${this.estimateTokenCount(truncated)} tokens)`
+    )
+
+    return truncated
+  }
+
+  /**
+   * Hard character limit as a last-resort safety valve.
+   * Some backends report "input length exceeds context length" even when
+   * our token estimate is within bounds (dense technical text, long tokens).
+   */
+  private truncateToCharLimit(text: string, maxChars: number): string {
+    if (text.length <= maxChars) {
+      return text
+    }
+
+    let truncated = text.substring(0, maxChars)
+    const lastSpace = truncated.lastIndexOf(' ')
+
+    if (lastSpace > maxChars * 0.8) {
+      truncated = truncated.substring(0, lastSpace)
+    }
+
+    logger.warn(
+      `[RAG] Hard-truncated text from ${text.length} to ${truncated.length} chars (char limit: ${maxChars})`
     )
 
     return truncated
@@ -312,6 +350,12 @@ export class RagService {
           chunkText = this.truncateToTokenLimit(chunkText, maxTokensForText)
         }
 
+        // Hard char limit as a final safety net for strict embedding backends
+        const hardCharLimit = RagService.MAX_SAFE_TOKENS
+        if (chunkText.length > hardCharLimit) {
+          chunkText = this.truncateToCharLimit(chunkText, hardCharLimit)
+        }
+
         prefixedChunks.push(RagService.SEARCH_DOCUMENT_PREFIX + chunkText)
       }
 
@@ -326,9 +370,44 @@ export class RagService {
 
         logger.debug(`[RAG] Embedding batch ${batchIdx + 1}/${totalBatches} (${batch.length} chunks)`)
 
-        const response = await this.ollamaService.embed(this.resolvedEmbeddingModel ?? RagService.EMBEDDING_MODEL, batch)
+        try {
+          const response = await this.ollamaService.embed(
+            this.resolvedEmbeddingModel ?? RagService.EMBEDDING_MODEL,
+            batch
+          )
+          embeddings.push(...response.embeddings)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          logger.warn(
+            `[RAG] Batch embedding failed at batch ${batchIdx + 1}/${totalBatches}. ` +
+            `Retrying per-chunk fallback. Error: ${message}`
+          )
 
-        embeddings.push(...response.embeddings)
+          for (let i = 0; i < batch.length; i++) {
+            let single = batch[i]
+            try {
+              const singleResp = await this.ollamaService.embed(
+                this.resolvedEmbeddingModel ?? RagService.EMBEDDING_MODEL,
+                [single]
+              )
+              embeddings.push(singleResp.embeddings[0])
+            } catch (singleError) {
+              const singleMsg = singleError instanceof Error ? singleError.message : String(singleError)
+              if (singleMsg.toLowerCase().includes('context length')) {
+                // Last-resort trim for dense content (common in extracted ZIM text).
+                const hardLimit = Math.max(512, Math.floor(RagService.MAX_SAFE_TOKENS * 0.75))
+                single = this.truncateToCharLimit(single, hardLimit)
+                const retryResp = await this.ollamaService.embed(
+                  this.resolvedEmbeddingModel ?? RagService.EMBEDDING_MODEL,
+                  [single]
+                )
+                embeddings.push(retryResp.embeddings[0])
+              } else {
+                throw singleError
+              }
+            }
+          }
+        }
 
         if (onProgress) {
           const progress = ((batchStart + batch.length) / prefixedChunks.length) * 100
@@ -388,8 +467,8 @@ export class RagService {
 
       return { chunks: chunks.length }
     } catch (error) {
-      console.error(error)
-      logger.error('[RAG] Error embedding text:', error)
+      const message = error instanceof Error ? error.message : String(error)
+      logger.error(`[RAG] Error embedding text: ${message}`, error)
       return null
     }
   }
@@ -426,10 +505,20 @@ export class RagService {
   }
 
   private async extractImageText(filebuffer: Buffer): Promise<string> {
-    const worker = await createWorker('eng')
-    const result = await worker.recognize(filebuffer)
-    await worker.terminate()
-    return result.data.text
+    try {
+      const { lang, langPath, cachePath } = await this.ensureOcrLanguageData()
+      const options = {
+        ...(langPath ? { langPath } : {}),
+        ...(cachePath ? { cachePath } : {}),
+      }
+      const worker = await createWorker(lang, 1, options)
+      const result = await worker.recognize(filebuffer)
+      await worker.terminate()
+      return result.data.text
+    } catch (error) {
+      logger.error('[RAG] OCR failed while processing image', error)
+      return ''
+    }
   }
 
   private async processImageFile(fileBuffer: Buffer): Promise<string> {
@@ -459,6 +548,48 @@ export class RagService {
     }
 
     return extractedText
+  }
+
+  private async ensureOcrLanguageData(): Promise<{
+    lang: string
+    langPath?: string
+    cachePath?: string
+  }> {
+    const lang = RagService.OCR_LANGUAGE
+    if (RagService.OCR_LANG_PATH) {
+      return { lang, langPath: RagService.OCR_LANG_PATH, cachePath: RagService.OCR_LANG_PATH }
+    }
+
+    const ocrDir = join(process.cwd(), RagService.OCR_STORAGE_PATH)
+    const langFile = join(ocrDir, `${lang}.traineddata`)
+    const existing = await getFileStatsIfExists(langFile)
+    if (!existing) {
+      if (!RagService.OCR_LANG_DATA_URL) {
+        logger.warn(
+          `[RAG] OCR language data missing (${langFile}). ` +
+          'Set NOMAD_OCR_LANG_DATA_URL or place the traineddata file in that path.'
+        )
+        return { lang }
+      }
+
+      const baseUrl = RagService.OCR_LANG_DATA_URL.replace(/\/$/, '')
+      const url = `${baseUrl}/${lang}.traineddata`
+      logger.info(`[RAG] Downloading OCR language data from ${url}`)
+      try {
+        await doResumableDownloadWithRetry({
+          url,
+          filepath: langFile,
+          timeout: 30000,
+          allowedMimeTypes: [],
+          max_retries: 2,
+        })
+      } catch (error) {
+        logger.error('[RAG] Failed to download OCR language data', error)
+        return { lang }
+      }
+    }
+
+    return { lang, langPath: ocrDir, cachePath: ocrDir }
   }
 
   /**
@@ -539,6 +670,19 @@ export class RagService {
     logger.info(
       `[RAG] Successfully embedded ${totalChunks} total chunks from ${articlesInBatch} articles (hasMore: ${hasMoreBatches})`
     )
+
+    // Avoid infinite re-queue loops: a ZIM that yields zero chunks should be treated as a failed
+    // extraction/embedding pass, not a successful completion.
+    if (totalChunks === 0) {
+      return {
+        success: false,
+        message: 'No extractable content found in ZIM file.',
+        chunks: 0,
+        hasMoreBatches: false,
+        totalArticles: articlesInBatch,
+        articlesProcessed: articlesInBatch,
+      }
+    }
 
     // Only delete the file when:
     // 1. deleteAfterEmbedding is true (caller wants deletion)
@@ -691,6 +835,11 @@ export class RagService {
     onProgress?: (percent: number) => Promise<void>
   ): Promise<ProcessAndEmbedFileResponse> {
     try {
+      if (this.shouldSkipEmbeddingFile(filepath)) {
+        logger.info(`[RAG] Skipping non-content file during embedding: ${filepath}`)
+        return { success: true, message: 'Skipped non-content metadata file.', chunks: 0 }
+      }
+
       const fileType = determineFileType(filepath)
       logger.debug(`[RAG] Processing file: ${filepath} (detected type: ${fileType})`)
 
@@ -1051,6 +1200,185 @@ export class RagService {
     }
   }
 
+  private sourceToDisplayName(source: string): string {
+    const base = source.split(/[/\\]/).pop() || source
+    const uploadMatch = base.match(/^(.+?\.[^.]+)-[a-f0-9]{8,}(\.[^.]+)$/i)
+    if (uploadMatch && uploadMatch[1].toLowerCase().endsWith(uploadMatch[2].toLowerCase())) {
+      return uploadMatch[1]
+    }
+    return base
+  }
+
+  private normalizeFileLookupText(value: string): string {
+    return value
+      .toLowerCase()
+      .replace(/[`"'']/g, ' ')
+      .replace(/[._-]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+
+  private isUploadedKbSource(source: string): boolean {
+    return source.replace(/\\/g, '/').toLowerCase().includes('/storage/kb_uploads/')
+  }
+
+  private listDisplayNamesForSources(sources: string[], extension?: string): string[] {
+    const names = sources
+      .map((source) => this.sourceToDisplayName(source))
+      .filter((name) => !extension || name.toLowerCase().endsWith(extension.toLowerCase()))
+
+    return Array.from(new Set(names)).sort((a, b) => a.localeCompare(b))
+  }
+
+  private rankStoredFilesByQuery(files: string[], query: string, limit: number): string[] {
+    if (files.length === 0) return []
+
+    const normalizedQuery = this.normalizeFileLookupText(query)
+    if (!normalizedQuery) return []
+
+    const explicitFileMatch = query.match(/\b([a-zA-Z0-9][a-zA-Z0-9._-]*\.[a-zA-Z0-9]{2,6})\b/)
+    const explicitFile = explicitFileMatch
+      ? this.normalizeFileLookupText(explicitFileMatch[1])
+      : ''
+    const looksLikeUploadQuery =
+      /\b(pdf|document|documents|file|files|upload|uploads|uploaded|kb|knowledge base|library)\b/i.test(
+        query
+      )
+
+    const ignoredTokens = new Set([
+      'rag',
+      'summarize',
+      'summary',
+      'document',
+      'documents',
+      'file',
+      'files',
+      'pdf',
+      'library',
+      'knowledge',
+      'base',
+      'what',
+      'which',
+      'show',
+      'list',
+      'tell',
+      'about',
+      'the',
+      'do',
+      'you',
+      'have',
+      'in',
+      'my',
+    ])
+
+    const queryTokens = normalizedQuery
+      .split(' ')
+      .filter((token) => token.length > 1 && !ignoredTokens.has(token))
+
+    const ranked = files
+      .map((source) => {
+        const displayName = this.sourceToDisplayName(source)
+        const normalizedName = this.normalizeFileLookupText(displayName)
+        let score = 0
+
+        if (explicitFile) {
+          if (normalizedName === explicitFile) score += 200
+          if (normalizedName.includes(explicitFile)) score += 120
+          if (explicitFile.includes(normalizedName)) score += 80
+        }
+
+        if (normalizedName.includes(normalizedQuery)) score += 60
+
+        for (const token of queryTokens) {
+          if (normalizedName.includes(token)) score += 10
+        }
+
+        if (looksLikeUploadQuery && this.isUploadedKbSource(source)) {
+          score += 15
+        }
+
+        return { source, displayName, score }
+      })
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score || a.displayName.length - b.displayName.length)
+
+    return ranked.slice(0, limit).map((item) => item.source)
+  }
+
+  public async getStoredFileDisplayNames(extension?: string): Promise<string[]> {
+    const files = await this.getStoredFiles()
+    return this.listDisplayNamesForSources(files, extension)
+  }
+
+  public async getUploadedFileDisplayNames(extension?: string): Promise<string[]> {
+    const files = await this.getStoredFiles()
+    return this.listDisplayNamesForSources(
+      files.filter((source) => this.isUploadedKbSource(source)),
+      extension
+    )
+  }
+
+  public async findStoredFilesByQuery(query: string, limit: number = 3): Promise<string[]> {
+    const files = await this.getStoredFiles()
+    return this.rankStoredFilesByQuery(files, query, limit)
+  }
+
+  public async findUploadedFilesByQuery(query: string, limit: number = 3): Promise<string[]> {
+    const files = await this.getStoredFiles()
+    return this.rankStoredFilesByQuery(
+      files.filter((source) => this.isUploadedKbSource(source)),
+      query,
+      limit
+    )
+  }
+
+  public async getDocumentsBySource(
+    source: string,
+    limit: number = 5
+  ): Promise<Array<{ text: string; score: number; metadata?: Record<string, any> }>> {
+    try {
+      await this._ensureCollection(
+        RagService.CONTENT_COLLECTION_NAME,
+        RagService.EMBEDDING_DIMENSION
+      )
+
+      const points: Array<Record<string, any>> = []
+      let offset: string | number | null | Record<string, unknown> = null
+
+      do {
+        const scrollResult = await this.qdrant!.scroll(RagService.CONTENT_COLLECTION_NAME, {
+          limit: 100,
+          offset,
+          with_payload: true,
+          with_vector: false,
+          filter: {
+            must: [{ key: 'source', match: { value: source } }],
+          },
+        })
+
+        points.push(...scrollResult.points)
+        offset = scrollResult.next_page_offset || null
+      } while (offset !== null && points.length < 200)
+
+      return points
+        .map((point) => ({
+          text: (point.payload?.text as string) || '',
+          score: 1,
+          metadata: {
+            source: point.payload?.source as string | undefined,
+            chunk_index: (point.payload?.chunk_index as number) || 0,
+            created_at: (point.payload?.created_at as number) || 0,
+          },
+        }))
+        .filter((doc) => doc.text.trim().length > 0)
+        .sort((a, b) => ((a.metadata?.chunk_index as number) || 0) - ((b.metadata?.chunk_index as number) || 0))
+        .slice(0, limit)
+    } catch (error) {
+      logger.error('[RAG] Error retrieving documents by source:', error)
+      return []
+    }
+  }
+
   /**
    * Delete all Qdrant points associated with a given source path and remove
    * the corresponding file from disk if it lives under the uploads directory.
@@ -1170,8 +1498,9 @@ export class RagService {
 
       const filesInStorage: string[] = []
 
-      // Force resync of Nomad docs
-      await this.discoverNomadDocs(true).catch((error) => {
+      // Keep docs discovery idempotent during normal sync.
+      // Forcing this on every sync re-queues docs repeatedly even when nothing changed.
+      await this.discoverNomadDocs(false).catch((error) => {
         logger.error('[RAG] Error during Nomad docs discovery in sync process:', error)
       })
 
@@ -1197,6 +1526,8 @@ export class RagService {
         const zimContents = await listDirectoryContentsRecursive(ZIM_PATH)
         zimContents.forEach((entry) => {
           if (entry.type === 'file') {
+            // Only embed actual ZIM archives from this directory.
+            if (!entry.key.toLowerCase().endsWith('.zim')) return
             filesInStorage.push(entry.key)
           }
         })
@@ -1244,7 +1575,6 @@ export class RagService {
 
       // Find files that are in storage but not in Qdrant
       const filesToEmbed = filesInStorage.filter((filePath) => !sourcesInQdrant.has(filePath))
-
       logger.info(`[RAG] Found ${filesToEmbed.length} files that need embedding`)
 
       if (filesToEmbed.length === 0) {
@@ -1267,12 +1597,14 @@ export class RagService {
           const stats = await getFileStatsIfExists(filePath)
 
           logger.info(`[RAG] Dispatching embed job for: ${fileName}`)
-          await EmbedFileJob.dispatch({
+          const dispatchResult = await EmbedFileJob.dispatch({
             filePath: filePath,
             fileName: fileName,
             fileSize: stats?.size,
           })
-          queuedCount++
+          if (dispatchResult.created) {
+            queuedCount++
+          }
           logger.debug(`[RAG] Successfully dispatched job for ${fileName}`)
         } catch (fileError) {
           logger.error(`[RAG] Error dispatching job for file ${filePath}:`, fileError)

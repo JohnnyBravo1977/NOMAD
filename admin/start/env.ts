@@ -61,4 +61,19 @@ export default await Env.create(new URL('../', import.meta.url), {
   |----------------------------------------------------------
   */
   NOMAD_API_URL: Env.schema.string.optional(),
+
+  /*
+  |----------------------------------------------------------
+  | AI / Ollama tuning
+  |----------------------------------------------------------
+  */
+  NOMAD_OLLAMA_KEEP_ALIVE: Env.schema.string.optional(),
+  NOMAD_OLLAMA_KEEP_ALIVE_MODELS: Env.schema.string.optional(),
+  NOMAD_DISABLE_QUERY_REWRITE: Env.schema.boolean.optional(),
+  NOMAD_DISABLE_RAG: Env.schema.boolean.optional(),
+  NOMAD_RAG_MIN_SCORE: Env.schema.number.optional(),
+  NOMAD_RAG_MIN_CHARS: Env.schema.number.optional(),
+  NOMAD_OLLAMA_KV_CACHE_TYPE: Env.schema.string.optional(),
+  NOMAD_OLLAMA_MAX_QUEUE: Env.schema.string.optional(),
+  NOMAD_TIMEZONE: Env.schema.string.optional(),
 })

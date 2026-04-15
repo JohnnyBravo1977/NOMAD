@@ -106,18 +106,35 @@ export class ZIMExtractionService {
 
                 if (strategy === 'structured') {
                     const structured = this.extractStructuredContent(html)
-                    chunks = structured.sections.map(s => ({
-                        text: s.text,
-                        articleTitle,
-                        articlePath: entry.path,
-                        sectionTitle: s.heading,
-                        fullTitle: `${articleTitle} - ${s.heading}`,
-                        hierarchy: `${articleTitle} > ${s.heading}`,
-                        sectionLevel: s.level,
-                        documentId,
-                        archiveMetadata,
-                        strategy,
-                    }))
+                    if (structured.sections.length > 0) {
+                        chunks = structured.sections.map(s => ({
+                            text: s.text,
+                            articleTitle,
+                            articlePath: entry.path,
+                            sectionTitle: s.heading,
+                            fullTitle: `${articleTitle} - ${s.heading}`,
+                            hierarchy: `${articleTitle} > ${s.heading}`,
+                            sectionLevel: s.level,
+                            documentId,
+                            archiveMetadata,
+                            strategy,
+                        }))
+                    } else {
+                        // Some sites wrap all content in nested containers. If structured extraction
+                        // yields no sections, fallback to whole-page text instead of returning empty.
+                        const text = this.extractTextFromHTML(html) || ''
+                        chunks = [{
+                            text,
+                            articleTitle,
+                            articlePath: entry.path,
+                            sectionTitle: articleTitle,
+                            fullTitle: articleTitle,
+                            hierarchy: articleTitle,
+                            documentId,
+                            archiveMetadata,
+                            strategy: 'simple',
+                        }]
+                    }
                 } else {
                     // Simple strategy - entire article as one chunk
                     const text = this.extractTextFromHTML(html) || ''

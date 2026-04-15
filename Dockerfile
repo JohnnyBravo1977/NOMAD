@@ -1,7 +1,8 @@
 FROM node:22-slim AS base
 
-# Install bash & curl for entrypoint script compatibility, graphicsmagick for pdf2pic, and vips-dev & build-base for sharp 
-RUN apt-get update && apt-get install -y bash curl graphicsmagick libvips-dev build-essential
+# Install bash & curl for entrypoint script compatibility, graphicsmagick for pdf2pic, and vips-dev & build-base for sharp
+# Use --fix-missing to reduce transient mirror hash issues
+RUN apt-get update && apt-get install -y --fix-missing bash curl graphicsmagick libvips-dev build-essential
 
 # All deps stage
 FROM base AS deps

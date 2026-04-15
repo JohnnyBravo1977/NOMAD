@@ -45,6 +45,8 @@ type ChatInput = {
   think?: boolean | 'medium'
   stream?: boolean
   numCtx?: number
+  keepAlive?: string
+  maxTokens?: number
 }
 
 @inject()
@@ -77,6 +79,14 @@ export class OllamaService {
           apiKey: 'nomad', // Required by SDK; not validated by Ollama/LM Studio/llama.cpp
           baseURL: `${this.baseUrl}/v1`,
         })
+
+        // Best-effort detect whether we're talking to native Ollama for feature flags
+        try {
+          const response = await axios.get(`${this.baseUrl}/api/tags`, { timeout: 1000 })
+          this.isOllamaNative = Array.isArray(response.data?.models)
+        } catch {
+          this.isOllamaNative = false
+        }
       })()
     }
     return this.initPromise
@@ -203,6 +213,16 @@ export class OllamaService {
       throw new Error('AI client is not initialized.')
     }
 
+    if (this.isOllamaNative) {
+      try {
+        return await this.chatNative(chatRequest)
+      } catch (error) {
+        logger.warn(
+          `[OllamaService] Native /api/chat failed, falling back to /v1/chat: ${error instanceof Error ? error.message : error}`
+        )
+      }
+    }
+
     const params: any = {
       model: chatRequest.model,
       messages: chatRequest.messages as ChatCompletionMessageParam[],
@@ -213,6 +233,12 @@ export class OllamaService {
     }
     if (chatRequest.numCtx) {
       params.num_ctx = chatRequest.numCtx
+    }
+    if (chatRequest.maxTokens) {
+      params.max_tokens = chatRequest.maxTokens
+    }
+    if (chatRequest.keepAlive && this.isOllamaNative !== false) {
+      params.keep_alive = chatRequest.keepAlive
     }
 
     const response = await this.openai.chat.completions.create(params)
@@ -234,6 +260,16 @@ export class OllamaService {
       throw new Error('AI client is not initialized.')
     }
 
+    if (this.isOllamaNative) {
+      try {
+        return await this.chatStreamNative(chatRequest)
+      } catch (error) {
+        logger.warn(
+          `[OllamaService] Native /api/chat stream failed, falling back to /v1/chat: ${error instanceof Error ? error.message : error}`
+        )
+      }
+    }
+
     const params: any = {
       model: chatRequest.model,
       messages: chatRequest.messages as ChatCompletionMessageParam[],
@@ -244,6 +280,12 @@ export class OllamaService {
     }
     if (chatRequest.numCtx) {
       params.num_ctx = chatRequest.numCtx
+    }
+    if (chatRequest.maxTokens) {
+      params.max_tokens = chatRequest.maxTokens
+    }
+    if (chatRequest.keepAlive && this.isOllamaNative !== false) {
+      params.keep_alive = chatRequest.keepAlive
     }
 
     const stream = (await this.openai.chat.completions.create(params)) as unknown as Stream<ChatCompletionChunk>
@@ -314,6 +356,83 @@ export class OllamaService {
     return normalize()
   }
 
+  private async chatNative(chatRequest: ChatInput): Promise<NomadChatResponse> {
+    if (!this.baseUrl) {
+      throw new Error('AI service is not initialized.')
+    }
+    const payload: any = {
+      model: chatRequest.model,
+      messages: chatRequest.messages,
+      stream: false,
+    }
+    if (chatRequest.think) payload.think = chatRequest.think
+    if (chatRequest.keepAlive) payload.keep_alive = chatRequest.keepAlive
+    if (chatRequest.numCtx) {
+      payload.options = { ...(payload.options || {}), num_ctx: chatRequest.numCtx }
+    }
+    if (chatRequest.maxTokens) {
+      payload.options = { ...(payload.options || {}), num_predict: chatRequest.maxTokens }
+    }
+    try {
+      const response = await axios.post(`${this.baseUrl}/api/chat`, payload, { timeout: 0 })
+      return response.data as NomadChatResponse
+    } catch (error: any) {
+      const detail = error?.response?.data ? JSON.stringify(error.response.data) : (error?.message || String(error))
+      throw new Error(`Ollama /api/chat error: ${detail}`)
+    }
+  }
+
+  private async chatStreamNative(chatRequest: ChatInput): Promise<AsyncIterable<NomadChatStreamChunk>> {
+    if (!this.baseUrl) {
+      throw new Error('AI service is not initialized.')
+    }
+    const payload: any = {
+      model: chatRequest.model,
+      messages: chatRequest.messages,
+      stream: true,
+    }
+    if (chatRequest.think) payload.think = chatRequest.think
+    if (chatRequest.keepAlive) payload.keep_alive = chatRequest.keepAlive
+    if (chatRequest.numCtx) {
+      payload.options = { ...(payload.options || {}), num_ctx: chatRequest.numCtx }
+    }
+    if (chatRequest.maxTokens) {
+      payload.options = { ...(payload.options || {}), num_predict: chatRequest.maxTokens }
+    }
+
+    let response: any
+    try {
+      response = await axios.post(`${this.baseUrl}/api/chat`, payload, {
+        responseType: 'stream',
+        timeout: 0,
+      })
+    } catch (error: any) {
+      const detail = error?.response?.data ? JSON.stringify(error.response.data) : (error?.message || String(error))
+      throw new Error(`Ollama /api/chat stream error: ${detail}`)
+    }
+
+    async function* streamChunks(): AsyncIterable<NomadChatStreamChunk> {
+      let buffer = ''
+      for await (const chunk of response.data) {
+        buffer += chunk.toString()
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed) continue
+          try {
+            const parsed = JSON.parse(trimmed)
+            yield parsed as NomadChatStreamChunk
+          } catch {
+            // ignore partial lines
+          }
+        }
+      }
+    }
+
+    return streamChunks()
+  }
+
   public async checkModelHasThinking(modelName: string): Promise<boolean> {
     await this._ensureDependencies()
     if (!this.baseUrl) return false
@@ -374,13 +493,23 @@ export class OllamaService {
         throw new Error('Invalid /api/embed response — missing embeddings array')
       }
       return { embeddings: response.data.embeddings }
-    } catch {
+    } catch (error) {
       // Fall back to OpenAI-compatible /v1/embeddings
       // Explicitly request float format — some backends (e.g. LM Studio) don't reliably
       // implement the base64 encoding the OpenAI SDK requests by default.
       logger.info('[OllamaService] /api/embed unavailable, falling back to /v1/embeddings')
-      const results = await this.openai.embeddings.create({ model, input, encoding_format: 'float' })
-      return { embeddings: results.data.map((e) => e.embedding as number[]) }
+      try {
+        const results = await this.openai.embeddings.create({ model, input, encoding_format: 'float' })
+        return { embeddings: results.data.map((e) => e.embedding as number[]) }
+      } catch (fallbackError) {
+        const primaryError = error instanceof Error ? error.message : String(error)
+        const secondaryError = fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+        logger.error(
+          `[OllamaService] Embeddings failed (primary=/api/embed, fallback=/v1/embeddings). ` +
+          `primary="${primaryError}" fallback="${secondaryError}"`
+        )
+        throw fallbackError
+      }
     }
   }
 

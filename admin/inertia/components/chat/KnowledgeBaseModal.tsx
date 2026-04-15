@@ -67,6 +67,9 @@ export default function KnowledgeBaseModal({ aiAssistantName = "AI Assistant", o
   const syncMutation = useMutation({
     mutationFn: () => api.syncRAGStorage(),
     onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['embed-jobs'] })
+      queryClient.invalidateQueries({ queryKey: ['failedEmbedJobs'] })
+      queryClient.invalidateQueries({ queryKey: ['storedFiles'] })
       addNotification({
         type: 'success',
         message: data?.message || 'Storage synced successfully. If new files were found, they have been queued for processing.',
@@ -117,6 +120,7 @@ export default function KnowledgeBaseModal({ aiAssistantName = "AI Assistant", o
         title='Confirm Sync?'
         onConfirm={() => {
           syncMutation.mutate()
+          queryClient.invalidateQueries({ queryKey: ['embed-jobs'] })
           closeModal(
             "confirm-sync-modal"
           )

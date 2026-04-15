@@ -104,6 +104,9 @@ export class EmbedFileJob {
 
       if (!result.success) {
         logger.error(`[EmbedFileJob] Failed to process file ${fileName}: ${result.message}`)
+        if (result.message?.includes('No extractable content found in ZIM file')) {
+          throw new UnrecoverableError(result.message)
+        }
         throw new Error(result.message)
       }
 
@@ -210,6 +213,18 @@ export class EmbedFileJob {
     const jobId = this.getJobId(params.filePath)
 
     try {
+      // If a terminal job with the same deterministic ID exists, remove it so we can re-queue.
+      const existing = await queue.getJob(jobId)
+      if (existing) {
+        const state = await existing.getState()
+        if (state === 'completed' || state === 'failed') {
+          await existing.remove()
+          logger.info(
+            `[EmbedFileJob] Removed terminal existing job (${state}) for file: ${params.fileName}`
+          )
+        }
+      }
+
       const job = await queue.add(this.key, params, {
         jobId,
         attempts: 30,
@@ -232,12 +247,13 @@ export class EmbedFileJob {
     } catch (error) {
       if (error.message && error.message.includes('job already exists')) {
         const existing = await queue.getJob(jobId)
+        const state = existing ? await existing.getState() : 'unknown'
         logger.info(`[EmbedFileJob] Job already exists for file: ${params.fileName}`)
         return {
           job: existing,
           created: false,
           jobId,
-          message: `Embedding job already exists for: ${params.fileName}`,
+          message: `Embedding job already exists for: ${params.fileName} (state: ${state})`,
         }
       }
       throw error
