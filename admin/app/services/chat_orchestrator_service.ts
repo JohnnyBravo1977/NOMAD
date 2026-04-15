@@ -1,7 +1,9 @@
 import { inject } from '@adonisjs/core'
 import env from '#start/env'
 import path from 'node:path'
+import KVStore from '#models/kv_store'
 import { RagService } from '#services/rag_service'
+import { mkdir, writeFile } from 'fs/promises'
 
 type Message = { role: 'system' | 'user' | 'assistant'; content: string }
 
@@ -22,8 +24,151 @@ type RuntimeSettingsPlan = {
   maxTokens?: number
 }
 
+type PersonalizationPlan = {
+  lastUserText: string
+  userName: string | null
+  activeUser: string | null
+  profiles: Record<string, string[]>
+  systemMessages: Message[]
+}
+
+type DirectAnswerPlan = {
+  content: string
+} | null
+
 @inject()
 export class ChatOrchestratorService {
+  async preparePersonalization(args: {
+    messages: Message[]
+    assistantName: string
+    baseSystemPrompt: string
+    ragService: RagService
+  }): Promise<PersonalizationPlan> {
+    const { messages, assistantName, baseSystemPrompt, ragService } = args
+    const lastUserMessage = [...messages].reverse().find((m) => m.role === 'user')
+    const lastUserText = lastUserMessage?.content?.trim() || ''
+    const storedActiveUserRaw = await KVStore.getValue('ai.activeUserName')
+    const storedUserNameRaw = await KVStore.getValue('ai.userName')
+    const storedActiveUser = sanitizeStoredIdentityName(storedActiveUserRaw)
+    const storedUserName = sanitizeStoredIdentityName(storedUserNameRaw)
+
+    if (storedActiveUserRaw && !storedActiveUser) {
+      await KVStore.clearValue('ai.activeUserName')
+    }
+    if (storedUserNameRaw && !storedUserName) {
+      await KVStore.clearValue('ai.userName')
+    }
+
+    const detectedName = parseUserName(lastUserText)
+    if (detectedName) {
+      const normalizedName = normalizeUserName(detectedName)
+      await KVStore.setValue('ai.userName', normalizedName)
+      await KVStore.setValue('ai.activeUserName', normalizedName)
+
+      const profiles = await loadUserProfiles()
+      const existing = Array.isArray(profiles[normalizedName]) ? profiles[normalizedName] : []
+      if (!existing.some((fact) => fact.toLowerCase() === `name: ${normalizedName}`.toLowerCase())) {
+        profiles[normalizedName] = [...existing, `Name: ${normalizedName}`].slice(-50)
+        await saveUserProfiles(profiles)
+        await writeProfileToKb(normalizedName, profiles[normalizedName])
+      }
+    } else if (!storedActiveUser && storedUserName) {
+      await KVStore.setValue('ai.activeUserName', storedUserName)
+    }
+
+    const activeUser =
+      detectedName ? normalizeUserName(detectedName) : storedActiveUser || storedUserName
+
+    if (activeUser) {
+      await captureRelationshipFact(lastUserText, activeUser, ragService)
+      await forgetMemoryFacts(lastUserText, activeUser, ragService)
+      await capturePersonalFacts(lastUserText, activeUser, ragService)
+      await captureRelatedPersonFacts(lastUserText, activeUser, ragService)
+    }
+
+    if (shouldRememberFact(lastUserText)) {
+      const fact = normalizeFact(lastUserText)
+      if (activeUser && fact.length > 0) {
+        const profiles = await loadUserProfiles()
+        const list: string[] = Array.isArray(profiles[activeUser]) ? profiles[activeUser] : []
+        const deduped = list.filter((item) => item.toLowerCase() !== fact.toLowerCase())
+        deduped.push(fact)
+        profiles[activeUser] = deduped.slice(-50)
+        await saveUserProfiles(profiles)
+        await writeProfileToKb(activeUser, profiles[activeUser])
+        await scheduleProfilesSync(ragService)
+      }
+    }
+
+    const storedPromptRaw = await KVStore.getValue('ai.systemPrompt')
+    const storedPrompt = typeof storedPromptRaw === 'string' ? storedPromptRaw.trim() : ''
+    if (!storedPrompt) {
+      await KVStore.setValue('ai.systemPrompt', baseSystemPrompt)
+    }
+
+    const userName = detectedName ? normalizeUserName(detectedName) : storedUserName
+    const profiles = await loadUserProfiles()
+    const knownUsers = Object.keys(profiles)
+    const activeUserFacts = activeUser ? profiles[activeUser] || [] : []
+    const tz = env.get('NOMAD_TIMEZONE')
+    const nowText = formatLocalDateTime(tz)
+
+    const systemMessages: Message[] = []
+    const hasSystemMessage = messages.some((msg) => msg.role === 'system')
+    if (!hasSystemMessage) {
+      systemMessages.push({
+        role: 'system',
+        content: `${baseSystemPrompt}\nCurrent date/time: ${nowText}${tz ? ` (${tz})` : ''}\nYour name is ${assistantName}. If asked your name, answer "I'm ${assistantName} — your assistant here. How can I help today?"${userName ? `\nThe user's name is ${userName}. If asked who the user is, answer "${userName}".` : ''}${activeUser ? `\nYou are currently talking to ${activeUser}.` : ''}`,
+      })
+    }
+
+    if (activeUserFacts.length > 0 || knownUsers.length > 0) {
+      const memoryLines: string[] = []
+      if (activeUser) {
+        memoryLines.push(`Active user: ${activeUser}`)
+      }
+      if (activeUserFacts.length > 0) {
+        memoryLines.push(`Facts about ${activeUser}:\n- ${activeUserFacts.slice(-12).join('\n- ')}`)
+      }
+      if (knownUsers.length > 0) {
+        memoryLines.push(`Known family members: ${knownUsers.join(', ')}`)
+      }
+      systemMessages.push({
+        role: 'system',
+        content: `User memory (facts, always true):\n${memoryLines.join('\n')}\nIf asked about the user or family, answer using these facts.`,
+      })
+    }
+
+    return {
+      lastUserText,
+      userName,
+      activeUser,
+      profiles,
+      systemMessages,
+    }
+  }
+
+  async prepareDirectAnswer(args: {
+    lastUserText: string
+    profiles: Record<string, string[]>
+    activeUser: string | null
+    userName: string | null
+    ragService: RagService
+  }): Promise<DirectAnswerPlan> {
+    const { lastUserText, profiles, activeUser, userName, ragService } = args
+    const memoryAnswer = buildMemoryAnswer(lastUserText, profiles, activeUser || userName || null)
+    if (memoryAnswer) {
+      return { content: memoryAnswer }
+    }
+
+    const libraryAnswer = await buildLibraryInventoryAnswer(lastUserText, ragService)
+    if (libraryAnswer) {
+      return { content: libraryAnswer }
+    }
+
+    return null
+  }
+
   async prepareKnowledgeContext(args: {
     messages: Message[]
     lastUserText: string
@@ -192,4 +337,568 @@ export class ChatOrchestratorService {
 
     return { numCtx, keepAlive, maxTokens }
   }
+}
+
+function formatLocalDateTime(timezone?: string): string {
+  const now = new Date()
+  try {
+    if (timezone) {
+      return new Intl.DateTimeFormat('en-US', {
+        timeZone: timezone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true,
+      }).format(now)
+    }
+  } catch {
+  }
+  return now.toLocaleString()
+}
+
+function parseUserName(text: string): string | null {
+  const cleaned = text.trim().replace(/\s+/g, ' ')
+  if (!cleaned || cleaned.length > 80) return null
+
+  const patterns = [
+    /^(?:hi|hello|hey)[,! ]+(?:my name is|call me|this is|i am|i'm)\s+([a-zA-Z][a-zA-Z'.-]{0,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{0,30})?)\s*[.!?]*$/i,
+    /^(?:my name is|call me|this is)\s+([a-zA-Z][a-zA-Z'.-]{0,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{0,30})?)\s*[.!?]*$/i,
+    /^(?:i am|i'm)\s+([a-zA-Z][a-zA-Z'.-]{0,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{0,30})?)\s*[.!?]*$/i,
+  ]
+
+  for (const pattern of patterns) {
+    const match = cleaned.match(pattern)
+    const name = match?.[1]?.trim()
+    if (name && !isLikelyNonName(name)) {
+      return name
+    }
+  }
+
+  return null
+}
+
+function shouldRememberFact(text: string): boolean {
+  const trimmed = text.trim()
+  if (/^(remember|note|keep this in mind|for my profile|profile)\s*[:\-]/i.test(trimmed)) return true
+  if (/^remember that\s+/i.test(trimmed)) return true
+  return false
+}
+
+function normalizeFact(text: string): string {
+  return text
+    .replace(/^(remember|note|keep this in mind|for my profile|profile)\s*[:\-]\s*/i, '')
+    .replace(/^remember that\s+/i, '')
+    .trim()
+}
+
+function normalizeUserName(name: string): string {
+  return name
+    .split(/\s+/)
+    .map((part) => (part ? part[0].toUpperCase() + part.slice(1) : part))
+    .join(' ')
+}
+
+function sanitizeStoredIdentityName(name: string | null | undefined): string | null {
+  if (!name || typeof name !== 'string') return null
+  const cleaned = name.trim()
+  if (!cleaned) return null
+  const normalized = normalizeUserName(cleaned)
+  return isLikelyNonName(normalized) ? null : normalized
+}
+
+function isLikelyNonName(name: string): boolean {
+  const cleaned = name.toLowerCase().replace(/\s+/g, ' ').trim()
+  if (!cleaned) return true
+
+  const exactBlacklist = new Set([
+    'fine', 'good', 'okay', 'ok', 'great', 'here', 'there', 'me', 'you', 'done', 'finished',
+    'ready', 'busy', 'hungry', 'tired', 'sleepy', 'reason', 'moment', 'wife', 'husband',
+    'partner', 'spouse', 'mother', 'father', 'mom', 'dad', 'son', 'daughter', 'child',
+    'children', 'kid', 'kids', 'brother', 'sister', 'family',
+  ])
+  if (exactBlacklist.has(cleaned)) return true
+
+  const invalidTokens = new Set(['you', 'your', 'yours', 'me', 'myself'])
+  return cleaned.split(' ').some((token) => invalidTokens.has(token))
+}
+
+async function loadUserProfiles(): Promise<Record<string, string[]>> {
+  try {
+    const profilesRaw = await KVStore.getValue('ai.userProfiles')
+    const parsed = profilesRaw ? JSON.parse(String(profilesRaw)) : {}
+    const profiles = typeof parsed === 'object' && parsed ? parsed : {}
+    const { normalized, changed } = normalizeProfiles(profiles)
+    if (changed) {
+      await KVStore.setValue('ai.userProfiles', JSON.stringify(normalized))
+    }
+    return normalized
+  } catch {
+    return {}
+  }
+}
+
+async function saveUserProfiles(profiles: Record<string, string[]>) {
+  await KVStore.setValue('ai.userProfiles', JSON.stringify(profiles))
+}
+
+async function writeProfileToKb(userName: string, facts: string[]) {
+  const safeName = userName.replace(/[^a-zA-Z0-9_.-]/g, '_')
+  const kbDir = path.join(process.cwd(), 'storage', 'kb_uploads', 'family-profiles')
+  await mkdir(kbDir, { recursive: true })
+  const profileText = `Name: ${userName}\nFacts:\n- ${facts.map((fact) => canonicalizeProfileFact(fact)).join('\n- ')}\n`
+  await writeFile(path.join(kbDir, `${safeName}.txt`), profileText, 'utf-8')
+}
+
+async function scheduleProfilesSync(ragService: RagService) {
+  const lastSyncRaw = await KVStore.getValue('ai.userProfilesLastSync')
+  const lastSync = lastSyncRaw ? Number(lastSyncRaw) : 0
+  const now = Date.now()
+  if (now - lastSync > 10 * 60 * 1000) {
+    await KVStore.setValue('ai.userProfilesLastSync', String(now))
+    ragService.scanAndSyncStorage().catch(() => {})
+  }
+}
+
+async function captureRelationshipFact(text: string, activeUser: string, ragService: RagService) {
+  const relationship = parseRelationshipFact(text)
+  if (!relationship) return
+
+  const { relation, name } = relationship
+  const normalizedName = normalizeUserName(name)
+  const profiles = await loadUserProfiles()
+  const ownerFacts: string[] = Array.isArray(profiles[activeUser]) ? profiles[activeUser] : []
+  const ownerFact = `${relation}: ${normalizedName}`
+  const ownerDeduped = ownerFacts.filter((fact) => fact.toLowerCase() !== ownerFact.toLowerCase())
+  ownerDeduped.push(ownerFact)
+  profiles[activeUser] = ownerDeduped.slice(-50)
+
+  const relatedFacts: string[] = Array.isArray(profiles[normalizedName]) ? profiles[normalizedName] : []
+  const relatedFact = `${relationOf(relation)} of ${activeUser}`
+  const relatedDeduped = relatedFacts
+    .filter((fact) => !/^(husband|wife|spouse|partner) of /i.test(fact))
+    .filter((fact) => fact.toLowerCase() !== relatedFact.toLowerCase())
+  relatedDeduped.push(relatedFact)
+  profiles[normalizedName] = relatedDeduped.slice(-50)
+
+  await saveUserProfiles(profiles)
+  await writeProfileToKb(activeUser, profiles[activeUser])
+  await writeProfileToKb(normalizedName, profiles[normalizedName])
+  await scheduleProfilesSync(ragService)
+}
+
+async function capturePersonalFacts(text: string, activeUser: string, ragService: RagService) {
+  if (text.trim().endsWith('?')) return
+  const facts = parsePersonalFacts(text)
+  if (facts.length === 0) return
+
+  const profiles = await loadUserProfiles()
+  const existing: string[] = Array.isArray(profiles[activeUser]) ? profiles[activeUser] : []
+  const normalizedExisting = new Set(existing.map((f) => f.toLowerCase()))
+  const merged = [...existing]
+  for (const fact of facts) {
+    if (!normalizedExisting.has(fact.toLowerCase())) {
+      merged.push(fact)
+      normalizedExisting.add(fact.toLowerCase())
+    }
+  }
+
+  profiles[activeUser] = merged.slice(-50)
+  await saveUserProfiles(profiles)
+  await writeProfileToKb(activeUser, profiles[activeUser])
+  await scheduleProfilesSync(ragService)
+}
+
+async function forgetMemoryFacts(text: string, activeUser: string, ragService: RagService) {
+  const forgetTargets = parseForgetFacts(text)
+  if (forgetTargets.length === 0) return
+  const profiles = await loadUserProfiles()
+  const existing: string[] = Array.isArray(profiles[activeUser]) ? profiles[activeUser] : []
+  const loweredTargets = forgetTargets.map((t) => t.toLowerCase())
+  const next = existing.filter((fact) => !loweredTargets.some((target) => fact.toLowerCase().includes(target)))
+  profiles[activeUser] = next
+  await saveUserProfiles(profiles)
+  await writeProfileToKb(activeUser, profiles[activeUser])
+  await scheduleProfilesSync(ragService)
+}
+
+async function captureRelatedPersonFacts(text: string, activeUser: string, ragService: RagService) {
+  const parsed = parseRelatedPersonFact(text)
+  if (!parsed) return
+  const profiles = await loadUserProfiles()
+  const { relation, fact } = parsed
+  const relatedName = getRelatedPersonName(profiles[activeUser], relation)
+
+  const ownerFacts: string[] = Array.isArray(profiles[activeUser]) ? profiles[activeUser] : []
+  const ownerFact = `${relation} ${fact}`
+  const ownerDeduped = ownerFacts.filter((item) => item.toLowerCase() !== ownerFact.toLowerCase())
+  ownerDeduped.push(ownerFact)
+  profiles[activeUser] = ownerDeduped.slice(-50)
+  await writeProfileToKb(activeUser, profiles[activeUser])
+
+  if (relatedName) {
+    const relatedFacts: string[] = Array.isArray(profiles[relatedName]) ? profiles[relatedName] : []
+    const relatedDeduped = relatedFacts.filter((item) => item.toLowerCase() !== fact.toLowerCase())
+    relatedDeduped.push(fact)
+    profiles[relatedName] = relatedDeduped.slice(-50)
+    await writeProfileToKb(relatedName, profiles[relatedName])
+  }
+
+  await saveUserProfiles(profiles)
+  await scheduleProfilesSync(ragService)
+}
+
+function parseRelationshipFact(text: string): { relation: string; name: string } | null {
+  const cleaned = text.trim()
+  const patterns: Array<{ relation: string; re: RegExp }> = [
+    { relation: 'Wife', re: /\bmy wife['’]?s name is\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Wife', re: /\bmy wife is named\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Wife', re: /\bmy wife is called\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Husband', re: /\bmy husband['’]?s name is\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Husband', re: /\bmy husband is named\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Husband', re: /\bmy husband is called\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Partner', re: /\bmy partner['’]?s name is\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Partner', re: /\bmy partner is named\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Partner', re: /\bmy partner is called\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Daughter', re: /\bmy daughter['’]?s name is\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Daughter', re: /\bmy daughter is named\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Daughter', re: /\bmy daughter is called\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Son', re: /\bmy son['’]?s name is\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Son', re: /\bmy son is named\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Son', re: /\bmy son is called\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Child', re: /\bmy child['’]?s name is\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Child', re: /\bmy child is named\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Child', re: /\bmy child is called\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Mom', re: /\bmy mom['’]?s name is\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Mom', re: /\bmy mom is named\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Mom', re: /\bmy mom is called\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Dad', re: /\bmy dad['’]?s name is\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Dad', re: /\bmy dad is named\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Dad', re: /\bmy dad is called\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Sister', re: /\bmy sister['’]?s name is\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Sister', re: /\bmy sister is named\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Sister', re: /\bmy sister is called\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Brother', re: /\bmy brother['’]?s name is\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Brother', re: /\bmy brother is named\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+    { relation: 'Brother', re: /\bmy brother is called\s+([a-zA-Z][a-zA-Z'.-]{1,30}(?:\s+[a-zA-Z][a-zA-Z'.-]{1,30})?)\b/i },
+  ]
+
+  for (const entry of patterns) {
+    const match = cleaned.match(entry.re)
+    if (match?.[1]) {
+      const candidate = match[1].trim()
+      if (!isLikelyNonName(candidate)) {
+        return { relation: entry.relation, name: candidate }
+      }
+    }
+  }
+  return null
+}
+
+function parseRelatedPersonFact(text: string): { relation: string; fact: string } | null {
+  const cleaned = text.trim()
+  if (!cleaned || cleaned.endsWith('?')) return null
+  const patterns: Array<{ relation: string; re: RegExp; formatter: (match: RegExpMatchArray) => string }> = [
+    { relation: 'Wife', re: /\bmy wife(?:['’]?s)? (?:likes|loves|enjoys|prefers)\s+(.+?)(?:[.!]|$)/i, formatter: (m) => `Likes ${cleanupFactText(m[1])}` },
+    { relation: 'Wife', re: /\bmy wife(?:['’]?s)? (?:works at|works for|works as)\s+(.+?)(?:[.!]|$)/i, formatter: (m) => `Works ${m[0].includes('as') ? 'as' : m[0].includes('for') ? 'for' : 'at'} ${cleanupFactText(m[1])}` },
+    { relation: 'Wife', re: /\bmy wife(?:['’]?s)? lives in\s+(.+?)(?:[.!]|$)/i, formatter: (m) => `Lives in ${cleanupFactText(m[1])}` },
+    { relation: 'Husband', re: /\bmy husband(?:['’]?s)? (?:likes|loves|enjoys|prefers)\s+(.+?)(?:[.!]|$)/i, formatter: (m) => `Likes ${cleanupFactText(m[1])}` },
+    { relation: 'Husband', re: /\bmy husband(?:['’]?s)? (?:works at|works for|works as)\s+(.+?)(?:[.!]|$)/i, formatter: (m) => `Works ${m[0].includes('as') ? 'as' : m[0].includes('for') ? 'for' : 'at'} ${cleanupFactText(m[1])}` },
+    { relation: 'Husband', re: /\bmy husband(?:['’]?s)? lives in\s+(.+?)(?:[.!]|$)/i, formatter: (m) => `Lives in ${cleanupFactText(m[1])}` },
+    { relation: 'Son', re: /\bmy son(?:['’]?s)? (?:likes|loves|enjoys|prefers)\s+(.+?)(?:[.!]|$)/i, formatter: (m) => `Likes ${cleanupFactText(m[1])}` },
+    { relation: 'Daughter', re: /\bmy daughter(?:['’]?s)? (?:likes|loves|enjoys|prefers)\s+(.+?)(?:[.!]|$)/i, formatter: (m) => `Likes ${cleanupFactText(m[1])}` },
+    { relation: 'Child', re: /\bmy child(?:['’]?s)? (?:likes|loves|enjoys|prefers)\s+(.+?)(?:[.!]|$)/i, formatter: (m) => `Likes ${cleanupFactText(m[1])}` },
+  ]
+  for (const entry of patterns) {
+    const match = cleaned.match(entry.re)
+    if (match?.[1]) {
+      const fact = entry.formatter(match)
+      if (fact && !isLikelyTransientState(fact)) {
+        return { relation: entry.relation, fact }
+      }
+    }
+  }
+  return null
+}
+
+function getRelatedPersonName(facts: string[] | undefined, relation: string): string | null {
+  if (!facts || facts.length === 0) return null
+  const prefix = `${relation}: `
+  const match = facts.find((fact) => fact.toLowerCase().startsWith(prefix.toLowerCase()))
+  if (!match) return null
+  const name = match.slice(prefix.length).trim()
+  return name || null
+}
+
+function parsePersonalFacts(text: string): string[] {
+  const cleaned = text.trim()
+  if (!cleaned) return []
+  if (cleaned.length > 180) return []
+  if (/^(remember|note|keep this in mind|for my profile|profile)\s*[:\-]/i.test(cleaned)) {
+    const explicit = normalizeFact(cleaned)
+    return explicit ? [explicit] : []
+  }
+
+  const facts: string[] = []
+  const likeMatch = cleaned.match(/\bI (?:like|love|enjoy|prefer)\s+(.+?)(?:[.!]|$)/i)
+  if (likeMatch?.[1]) facts.push(`Likes ${cleanupFactText(likeMatch[1])}`)
+  const liveMatch = cleaned.match(/\bI live in\s+(.+?)(?:[.!]|$)/i)
+  if (liveMatch?.[1]) facts.push(`Lives in ${cleanupFactText(liveMatch[1])}`)
+  const fromMatch = cleaned.match(/\bI am from\s+(.+?)(?:[.!]|$)/i)
+  if (fromMatch?.[1]) facts.push(`From ${cleanupFactText(fromMatch[1])}`)
+  const workMatch = cleaned.match(/\bI work (?:as|at|for)\s+(.+?)(?:[.!]|$)/i)
+  if (workMatch?.[1]) {
+    const mode = workMatch[0].includes('as') ? 'as' : (workMatch[0].includes('for') ? 'for' : 'at')
+    facts.push(`Works ${mode} ${cleanupFactText(workMatch[1])}`)
+  }
+  const jobMatch = cleaned.match(/\bI am an?\s+([a-zA-Z][a-zA-Z\s]{1,60})(?:[.!]|$)/i)
+  if (jobMatch?.[1] && !isLikelyTransientState(jobMatch[1])) facts.push(`Is ${cleanupFactText(jobMatch[1])}`)
+  const haveMatch = cleaned.match(/\bI have\s+(.+?)(?:[.!]|$)/i)
+  if (haveMatch?.[1] && !isLikelyTransientState(haveMatch[1])) facts.push(`Has ${cleanupFactText(haveMatch[1])}`)
+  const favoriteMatch = cleaned.match(/\bmy (?:favorite|fav)\s+([a-zA-Z\s]+?)\s+is\s+(.+?)(?:[.!]|$)/i)
+  if (favoriteMatch?.[1] && favoriteMatch?.[2]) facts.push(`Favorite ${cleanupFactText(favoriteMatch[1])}: ${cleanupFactText(favoriteMatch[2])}`)
+  return facts.filter((fact) => fact.length > 3)
+}
+
+function parseForgetFacts(text: string): string[] {
+  const cleaned = text.trim()
+  const matches = cleaned.match(/^(forget|remove|delete)\s*(?:that)?\s*[:\-]?\s*(.+)$/i)
+  if (!matches?.[2]) return []
+  const target = matches[2].trim()
+  return target ? [target] : []
+}
+
+function cleanupFactText(text: string): string {
+  return text.replace(/[.?!]+$/, '').replace(/\s+/g, ' ').trim()
+}
+
+function buildMemoryAnswer(question: string, profiles: Record<string, string[]>, activeUser: string | null): string | null {
+  const cleaned = question.trim().toLowerCase()
+  if (!cleaned) return null
+  const knownUsers = Object.keys(profiles)
+  const activeFacts = activeUser ? profiles[activeUser] || [] : []
+  if (/^(who am i|who am i\?|who am i today)$/.test(cleaned)) {
+    return activeUser ? `You are ${activeUser}.` : null
+  }
+  if (/(tell me about myself|what do you know about me|what do you remember about me)/i.test(cleaned)) {
+    if (!activeUser || activeFacts.length === 0) {
+      return "I don't have any saved facts about you yet. Tell me a bit about yourself and I'll remember."
+    }
+    return `Here's what I have saved about you, ${activeUser}:\n- ${activeFacts.join('\n- ')}`
+  }
+  const relationQuery = parseRelationQuery(cleaned)
+  if (relationQuery) {
+    if (!activeUser) return null
+    const matches = findRelationFacts(activeFacts, relationQuery.relation)
+    if (matches.length > 0) {
+      const match = matches[0]
+      if (relationQuery.intent === 'about') {
+        if (relationQuery.relation === 'Child' && matches.length > 1) {
+          const childSummaries = matches.map((name) => {
+            const relatedFacts = profiles[name] || []
+            if (relatedFacts.length === 0) return `- ${name}`
+            return `- ${name}: ${relatedFacts.join('; ')}`
+          })
+          return `Here's what I have saved about your children:\n${childSummaries.join('\n')}`
+        }
+        const relatedFacts = profiles[match] || []
+        if (relatedFacts.length > 0) {
+          return `Here's what I have saved about your ${relationQuery.label}, ${match}:\n- ${relatedFacts.join('\n- ')}`
+        }
+      }
+      if (relationQuery.relation === 'Child' && matches.length > 1) {
+        return `Your children are ${formatNameList(matches)}.`
+      }
+      return `Your ${relationQuery.label} is ${match}.`
+    }
+    return `I don't have your ${relationQuery.label}'s name saved yet.`
+  }
+  const mentioned = findNamedMemoryQuery(question, knownUsers)
+  if (mentioned) {
+    const facts = profiles[mentioned] || []
+    if (facts.length === 0) return `I don't have any saved facts about ${mentioned} yet.`
+    return `Here's what I have saved about ${mentioned}:\n- ${facts.join('\n- ')}`
+  }
+  return null
+}
+
+function findNamedMemoryQuery(question: string, knownUsers: string[]): string | null {
+  for (const name of knownUsers) {
+    const escaped = escapeRegExp(name)
+    const patterns = [
+      new RegExp(`^(?:who is|who's)\\s+${escaped}\\??$`, 'i'),
+      new RegExp(`^(?:tell me about|what do you know about|what do you remember about)\\s+${escaped}\\??$`, 'i'),
+      new RegExp(`^(?:do you know|do you remember)\\s+(?:who\\s+)?${escaped}(?:\\s+is)?\\??$`, 'i'),
+    ]
+    if (patterns.some((pattern) => pattern.test(question.trim()))) return name
+  }
+  return null
+}
+
+function isLibraryInventoryQuestion(text: string): boolean {
+  const cleaned = text.trim().toLowerCase()
+  if (!cleaned) return false
+  return (
+    /(?:what|which|show|list).*(?:pdf|pdfs|file|files|document|documents).*(?:library|knowledge base|kb|uploaded)/i.test(cleaned) ||
+    /(?:what|which|show|list)\s+(?:uploads|uploaded files|uploaded documents|uploaded pdfs)/i.test(cleaned) ||
+    /what pdfs do you have/i.test(cleaned)
+  )
+}
+
+async function buildLibraryInventoryAnswer(question: string, ragService: RagService): Promise<string | null> {
+  if (!isLibraryInventoryQuestion(question)) return null
+  const wantsPdfOnly = /\bpdfs?\b/i.test(question)
+  const fileNames = wantsPdfOnly
+    ? await ragService.getUploadedFileDisplayNames('.pdf')
+    : await ragService.getUploadedFileDisplayNames()
+  if (fileNames.length === 0) {
+    return wantsPdfOnly
+      ? "I don't have any uploaded PDFs in the knowledge base yet."
+      : "I don't have any uploaded files in the knowledge base yet."
+  }
+  const visibleNames = fileNames.slice(0, 20)
+  const moreCount = fileNames.length - visibleNames.length
+  const heading = wantsPdfOnly
+    ? 'I currently have these uploaded PDFs in the knowledge base:'
+    : 'I currently have these uploaded files in the knowledge base:'
+  const suffix = moreCount > 0 ? `\n- ...and ${moreCount} more` : ''
+  return `${heading}\n- ${visibleNames.join('\n- ')}${suffix}`
+}
+
+function parseRelationQuery(text: string): { relation: string; label: string; intent: 'name' | 'about' } | null {
+  const cleaned = text.trim().toLowerCase()
+  if (!cleaned) return null
+  const relationMatchers = [
+    { relation: 'Wife', label: 'wife', aliases: ['wife'] },
+    { relation: 'Husband', label: 'husband', aliases: ['husband'] },
+    { relation: 'Partner', label: 'partner', aliases: ['partner'] },
+    { relation: 'Spouse', label: 'spouse', aliases: ['spouse'] },
+    { relation: 'Daughter', label: 'daughter', aliases: ['daughter'] },
+    { relation: 'Son', label: 'son', aliases: ['son'] },
+    { relation: 'Child', label: 'child', aliases: ['child', 'children', 'kid', 'kids'] },
+    { relation: 'Mom', label: 'mom', aliases: ['mom', 'mother'] },
+    { relation: 'Dad', label: 'dad', aliases: ['dad', 'father'] },
+    { relation: 'Sister', label: 'sister', aliases: ['sister'] },
+    { relation: 'Brother', label: 'brother', aliases: ['brother'] },
+  ] as const
+  for (const candidate of relationMatchers) {
+    for (const alias of candidate.aliases) {
+      const escaped = escapeRegExp(alias)
+      const namePatterns = [
+        new RegExp(`^(?:who is|who's)\\s+my\\s+${escaped}\\??$`, 'i'),
+        new RegExp(`^(?:what is|what's)\\s+my\\s+${escaped}(?:'s)?\\s+name\\??$`, 'i'),
+        new RegExp(`^(?:what is|what's)\\s+the\\s+name\\s+of\\s+my\\s+${escaped}\\??$`, 'i'),
+        new RegExp(`^(?:do you know|do you remember)\\s+my\\s+${escaped}(?:'s)?\\s+name\\??$`, 'i'),
+      ]
+      if (namePatterns.some((pattern) => pattern.test(cleaned))) {
+        return { relation: candidate.relation, label: candidate.label, intent: 'name' }
+      }
+      const aboutPatterns = [
+        new RegExp(`^(?:tell me about|what do you know about|what do you remember about)\\s+my\\s+${escaped}\\??$`, 'i'),
+        new RegExp(`^(?:do you know|do you remember)\\s+(?:anything\\s+about\\s+)?my\\s+${escaped}\\??$`, 'i'),
+      ]
+      if (aboutPatterns.some((pattern) => pattern.test(cleaned))) {
+        return { relation: candidate.relation, label: candidate.label, intent: 'about' }
+      }
+    }
+  }
+  return null
+}
+
+function findRelationFacts(facts: string[], relation: string): string[] {
+  const prefixes = [relation]
+  if (relation === 'Spouse') prefixes.push('Wife', 'Husband', 'Partner')
+  if (relation === 'Child') prefixes.push('Son', 'Daughter')
+  const matches: string[] = []
+  for (const prefix of prefixes) {
+    for (const fact of facts) {
+      if (!fact.toLowerCase().startsWith(`${prefix.toLowerCase()}: `)) continue
+      const value = fact.split(':').slice(1).join(':').trim()
+      if (value && !matches.includes(value)) matches.push(value)
+    }
+  }
+  return matches
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function isLikelyTransientState(text: string): boolean {
+  const lower = text.trim().toLowerCase()
+  const blacklist = ['ok', 'okay', 'fine', 'good', 'great', 'tired', 'sleepy', 'hungry', 'thirsty', 'busy', 'bored', 'here', 'there', 'ready', 'done']
+  return blacklist.includes(lower)
+}
+
+function relationOf(relation: string): string {
+  switch (relation) {
+    case 'Wife':
+    case 'Husband':
+    case 'Partner':
+      return 'Spouse'
+    case 'Mom':
+    case 'Dad':
+      return 'Parent'
+    case 'Son':
+      return 'Son'
+    case 'Daughter':
+      return 'Daughter'
+    case 'Child':
+      return 'Child'
+    case 'Brother':
+    case 'Sister':
+      return 'Sibling'
+    default:
+      return 'Family'
+  }
+}
+
+function canonicalizeProfileFact(fact: string): string {
+  const spouseMatch = fact.match(/^(husband|wife) of (.+)$/i)
+  if (spouseMatch) {
+    return `Spouse of ${spouseMatch[2].trim()}`
+  }
+  return fact
+}
+
+function formatNameList(names: string[]): string {
+  if (names.length === 0) return ''
+  if (names.length === 1) return names[0]
+  if (names.length === 2) return `${names[0]} and ${names[1]}`
+  return `${names.slice(0, -1).join(', ')}, and ${names[names.length - 1]}`
+}
+
+function normalizeProfiles(
+  profiles: Record<string, unknown>
+): { normalized: Record<string, string[]>; changed: boolean } {
+  const normalized: Record<string, string[]> = {}
+  let changed = false
+  for (const [name, facts] of Object.entries(profiles)) {
+    const safeName = sanitizeStoredIdentityName(name)
+    if (!safeName) {
+      changed = true
+      continue
+    }
+    const nextFacts = (Array.isArray(facts) ? facts : [])
+      .filter((fact): fact is string => typeof fact === 'string')
+      .map((fact) => fact.trim())
+      .filter(Boolean)
+      .filter((fact) => !hasInvalidFactValue(fact))
+      .map((fact) => canonicalizeProfileFact(fact))
+      .slice(-50)
+    if (safeName !== name || nextFacts.length !== (Array.isArray(facts) ? facts.length : 0)) {
+      changed = true
+    }
+    normalized[safeName] = nextFacts
+  }
+  return { normalized, changed }
+}
+
+function hasInvalidFactValue(fact: string): boolean {
+  const relationFact = fact.match(/^([A-Za-z]+):\s*(.+)$/)
+  if (!relationFact) return false
+  const value = relationFact[2]?.trim()
+  return !value || isLikelyNonName(value)
 }
