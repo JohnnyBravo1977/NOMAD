@@ -1,4 +1,5 @@
 import { ChatService } from '#services/chat_service'
+import { ChatOrchestratorService } from '#services/chat_orchestrator_service'
 import { DockerService } from '#services/docker_service'
 import { OllamaService } from '#services/ollama_service'
 import { RagService } from '#services/rag_service'
@@ -57,6 +58,7 @@ function stripReasoningBlocksAll(text: string): string {
 export default class OllamaController {
   constructor(
     private chatService: ChatService,
+    private chatOrchestratorService: ChatOrchestratorService,
     private dockerService: DockerService,
     private ollamaService: OllamaService,
     private ragService: RagService
@@ -254,124 +256,34 @@ export default class OllamaController {
       // Query rewriting for better RAG retrieval with manageable context
       // Will return user's latest message if no rewriting is needed
       // Reuse lastUserText for RAG logic
-      const looksLikeSmallTalk = /^(hi|hello|hey|yo|sup|what'?s up|how are you|how's it going|test|ping)[.!?]*$/i.test(lastUserText)
-      const ragMinChars = env.get('NOMAD_RAG_MIN_CHARS') ?? 60
-      const ragMinScore = env.get('NOMAD_RAG_MIN_SCORE') ?? 0.55
-      const disableRewrite = env.get('NOMAD_DISABLE_QUERY_REWRITE') === true
-      const disableRag = env.get('NOMAD_DISABLE_RAG') === true
-      const forceRag = lastUserText.toLowerCase().startsWith('rag:')
-      const looksLikeKbQuery =
-        /(pdf|document|documents|file|files|uploaded|upload|knowledge base|kb|manual|guide|notes?)/i.test(
-          lastUserText
-        )
-      if (forceRag) {
-        lastUserText = lastUserText.slice(4).trim()
-      }
-
-      let matchedSources: string[] = []
-      let matchedSourceDocs: Array<{ text: string; score: number; metadata?: Record<string, any> }> = []
-      const wantsDocumentSummary = /\b(summarize|summary|summarise|overview|what(?:'s| is) in|tell me about)\b/i.test(
-        lastUserText
-      )
-      if (!disableRag && (forceRag || looksLikeKbQuery)) {
-        matchedSources = await this.ragService.findUploadedFilesByQuery(lastUserText, 2)
-        if (matchedSources.length === 0) {
-          matchedSources = await this.ragService.findStoredFilesByQuery(lastUserText, 2)
-        }
-        if (matchedSources.length > 0) {
-          const matchedDocLimit = wantsDocumentSummary ? 8 : 4
-          for (const source of matchedSources) {
-            const docs = await this.ragService.getDocumentsBySource(source, matchedDocLimit)
-            matchedSourceDocs.push(...docs)
-          }
-        }
-      }
-
-      const rewriteStart = Date.now()
-      const rewrittenQuery = (looksLikeSmallTalk || disableRewrite)
-        ? (lastUserText || null)
-        : await this.rewriteQueryWithContext(reqData.messages)
-      const rewriteMs = Date.now() - rewriteStart
+      const knowledgePlan = await this.chatOrchestratorService.prepareKnowledgeContext({
+        messages: reqData.messages,
+        lastUserText,
+        model: reqData.model,
+        ragService: this.ragService,
+        rewriteQuery: (messages) => this.rewriteQueryWithContext(messages),
+        getContextLimitsForModel: (modelName) => this.getContextLimitsForModel(modelName),
+        buildRagPrompt: (context) => SYSTEM_PROMPTS.rag_context(context),
+      })
+      lastUserText = knowledgePlan.lastUserText
+      const rewrittenQuery = knowledgePlan.rewrittenQuery
+      const rewriteMs = knowledgePlan.rewriteMs
 
       logger.debug(`[OllamaController] Rewritten query for RAG: "${rewrittenQuery}"`)
-      // Skip RAG for very short or low-signal queries to avoid bloating the prompt.
-      let ragDocsCount = 0
-      let ragMs = 0
-      if (
-        !disableRag &&
-        rewrittenQuery &&
-        (forceRag || looksLikeKbQuery || rewrittenQuery.trim().length >= ragMinChars)
-      ) {
-        const ragStart = Date.now()
-        const relevantDocs = matchedSourceDocs.length > 0
-          ? matchedSourceDocs
-          : await this.ragService.searchSimilarDocuments(
-              rewrittenQuery,
-              5, // Top 5 most relevant chunks
-              0.3 // Minimum similarity score of 0.3
-            )
-        ragMs = Date.now() - ragStart
-
-        logger.debug(`[RAG] Retrieved ${relevantDocs.length} relevant documents for query: "${rewrittenQuery}"`)
-
-        // If relevant context is found, inject as a system message with adaptive limits
-        const topScore = matchedSourceDocs.length > 0 ? 1 : (relevantDocs[0]?.score ?? 0)
-        if (relevantDocs.length > 0 && (forceRag || matchedSourceDocs.length > 0 || topScore >= ragMinScore)) {
-          ragDocsCount = relevantDocs.length
-          // Determine context budget based on model size
-          const { maxResults, maxTokens } = this.getContextLimitsForModel(reqData.model)
-          let trimmedDocs = relevantDocs.slice(0, maxResults)
-
-          // Apply token cap if set (estimate ~3.5 chars per token)
-          // Always include the first (most relevant) result — the cap only gates subsequent results
-          if (maxTokens > 0) {
-            const charCap = maxTokens * 3.5
-            let totalChars = 0
-            trimmedDocs = trimmedDocs.filter((doc, idx) => {
-              totalChars += doc.text.length
-              return idx === 0 || totalChars <= charCap
-            })
-          }
-
-          logger.debug(
-            `[RAG] Injecting ${trimmedDocs.length}/${relevantDocs.length} results (model: ${reqData.model}, maxResults: ${maxResults}, maxTokens: ${maxTokens || 'unlimited'})`
-          )
-
-          const matchedFilesHeader = matchedSources.length > 0
-            ? `Matched file(s):\n${matchedSources.map((source) => `- ${path.basename(source)}`).join('\n')}\n\n`
-            : ''
-
-          const contextText = matchedFilesHeader + trimmedDocs
-            .map((doc, idx) => `[Context ${idx + 1}] (Relevance: ${(doc.score * 100).toFixed(1)}%)\n${doc.text}`)
-            .join('\n\n')
-
-          const systemMessage = {
-            role: 'system' as const,
-            content: SYSTEM_PROMPTS.rag_context(contextText),
-          }
-
-          // Insert system message at the beginning (after any existing system messages)
-          const firstNonSystemIndex = reqData.messages.findIndex((msg) => msg.role !== 'system')
-          const insertIndex = firstNonSystemIndex === -1 ? 0 : firstNonSystemIndex
-          reqData.messages.splice(insertIndex, 0, systemMessage)
-        }
+      const ragDocsCount = knowledgePlan.ragDocsCount
+      const ragMs = knowledgePlan.ragMs
+      if (knowledgePlan.systemMessage) {
+        const firstNonSystemIndex = reqData.messages.findIndex((msg) => msg.role !== 'system')
+        const insertIndex = firstNonSystemIndex === -1 ? 0 : firstNonSystemIndex
+        reqData.messages.splice(insertIndex, 0, knowledgePlan.systemMessage)
       }
 
-      // If system messages are large (e.g. due to RAG context), request a context window big
-      // enough to fit them. Ollama respects num_ctx per-request; LM Studio ignores it gracefully.
-      const systemChars = reqData.messages
-        .filter((m) => m.role === 'system')
-        .reduce((sum, m) => sum + m.content.length, 0)
-      const estimatedSystemTokens = Math.ceil(systemChars / 3.5)
-      let numCtx: number | undefined
-      if (estimatedSystemTokens > 3000) {
-        const needed = estimatedSystemTokens + 2048 // leave room for conversation + response
-        numCtx = [8192, 16384, 32768, 65536].find((n) => n >= needed) ?? 65536
-        logger.debug(`[OllamaController] Large system prompt (~${estimatedSystemTokens} tokens), requesting num_ctx: ${numCtx}`)
-      } else if (reqData.model === 'qwen3.5:35b-a3b-fast') {
-        // Keep fast chat lean unless we truly need a big context window
-        numCtx = 4096
-      }
+      const { numCtx, keepAlive, maxTokens } = this.chatOrchestratorService.buildRuntimeSettings({
+        messages: reqData.messages,
+        model: reqData.model,
+        lastUserText,
+        ragDocsCount,
+      })
 
       // Check if the model supports "thinking" capability for enhanced response generation
       // If gpt-oss model, it requires a text param for "think" https://docs.ollama.com/api/chat
@@ -383,23 +295,8 @@ export default class OllamaController {
           : false
       }
 
-      const keepAliveDefault = env.get('NOMAD_OLLAMA_KEEP_ALIVE')
-      const keepAliveModelsRaw = env.get('NOMAD_OLLAMA_KEEP_ALIVE_MODELS')
-      const keepAliveModels = (keepAliveModelsRaw || '')
-        .split(',')
-        .map((m) => m.trim())
-        .filter(Boolean)
-      const keepAlive = keepAliveModels.length > 0
-        ? (keepAliveModels.includes(reqData.model) ? keepAliveDefault : undefined)
-        : keepAliveDefault
-
       // Separate sessionId from the Ollama request payload — Ollama rejects unknown fields
       const { sessionId, ...ollamaRequest } = reqData
-      const isShortPrompt = lastUserText.length > 0 && lastUserText.length < 80
-      const maxTokens =
-        reqData.model === 'qwen3.5:35b-a3b-fast' && isShortPrompt && !ragDocsCount
-          ? 128
-          : undefined
 
       // Optional prompt logging for debugging performance issues
       await this.logPromptIfEnabled({
