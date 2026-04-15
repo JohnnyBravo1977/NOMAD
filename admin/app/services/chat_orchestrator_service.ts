@@ -4,6 +4,7 @@ import path from 'node:path'
 import KVStore from '#models/kv_store'
 import { RagService } from '#services/rag_service'
 import { ChatService } from '#services/chat_service'
+import { OllamaService } from '#services/ollama_service'
 import { mkdir, writeFile } from 'fs/promises'
 
 type Message = { role: 'system' | 'user' | 'assistant'; content: string }
@@ -54,9 +55,21 @@ type StreamingReplyState = {
   dropFence: boolean
 }
 
+type ChatExecutionOptions = {
+  model: string
+  messages: Message[]
+  think: boolean | 'medium'
+  numCtx?: number
+  keepAlive?: string
+  maxTokens?: number
+}
+
 @inject()
 export class ChatOrchestratorService {
-  constructor(private chatService: ChatService) {}
+  constructor(
+    private chatService: ChatService,
+    private ollamaService: OllamaService
+  ) {}
 
   async preparePersonalization(args: {
     messages: Message[]
@@ -467,6 +480,40 @@ export class ChatOrchestratorService {
         : chunk
 
     return { state, outgoingChunk }
+  }
+
+  async executeStreamingChat(
+    args: ChatExecutionOptions & { onChunk: (chunk: StreamChunk) => void | Promise<void> }
+  ): Promise<{ fullContent: string; ttfbMs: number | null; chatMs: number }> {
+    const { onChunk, ...request } = args
+    const chatStart = Date.now()
+    const stream = await this.ollamaService.chatStream(request)
+    const streamingState = this.createStreamingReplyState()
+
+    for await (const chunk of stream) {
+      const { outgoingChunk } = this.processStreamingChunk(streamingState, chunk)
+      await onChunk(outgoingChunk)
+    }
+
+    return {
+      fullContent: streamingState.fullContent,
+      ttfbMs: streamingState.firstChunkAt ? streamingState.firstChunkAt - chatStart : null,
+      chatMs: Date.now() - chatStart,
+    }
+  }
+
+  async executeChat(
+    args: ChatExecutionOptions
+  ): Promise<{ result: any; chatMs: number }> {
+    const chatStart = Date.now()
+    const result = await this.ollamaService.chat(args)
+    if (result?.message?.content) {
+      result.message.content = this.sanitizeAssistantContent(result.message.content)
+    }
+    return {
+      result,
+      chatMs: Date.now() - chatStart,
+    }
   }
 }
 

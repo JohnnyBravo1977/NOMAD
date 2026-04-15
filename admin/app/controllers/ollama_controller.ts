@@ -160,22 +160,22 @@ export default class OllamaController {
 
       if (reqData.stream) {
         logger.debug(`[OllamaController] Initiating streaming response for model: "${reqData.model}" with think: ${think}`)
-        // Headers already flushed above
-        const chatStart = Date.now()
-        const stream = await this.ollamaService.chatStream({ ...ollamaRequest, think, numCtx, keepAlive, maxTokens })
-        const streamingState = this.chatOrchestratorService.createStreamingReplyState()
-        for await (const chunk of stream) {
-          const { outgoingChunk } = this.chatOrchestratorService.processStreamingChunk(streamingState, chunk)
-          response.response.write(`data: ${JSON.stringify(outgoingChunk)}\n\n`)
-        }
+        const streamResult = await this.chatOrchestratorService.executeStreamingChat({
+          ...ollamaRequest,
+          think,
+          numCtx,
+          keepAlive,
+          maxTokens,
+          onChunk: async (chunk) => {
+            response.response.write(`data: ${JSON.stringify(chunk)}\n\n`)
+          },
+        })
         response.response.end()
-        const chatMs = Date.now() - chatStart
 
-        // Save assistant message and optionally generate title
         await this.chatOrchestratorService.saveAssistantReply({
           sessionId: sessionId ?? null,
           userContent,
-          assistantContent: streamingState.fullContent,
+          assistantContent: streamResult.fullContent,
         })
         const perfPayload = {
           timestamp: new Date().toISOString(),
@@ -188,22 +188,22 @@ export default class OllamaController {
           rewriteMs,
           ragMs,
           ragDocsCount,
-          ttfbMs: streamingState.firstChunkAt ? streamingState.firstChunkAt - chatStart : null,
+          ttfbMs: streamResult.ttfbMs,
           totalMs: Date.now() - perfStart,
-          chatMs,
+          chatMs: streamResult.chatMs,
         }
         console.log('[ChatPerf]', JSON.stringify(perfPayload))
         await this.logChatPerfIfEnabled(perfPayload)
         return
       }
 
-      // Non-streaming (legacy) path
-      const chatStart = Date.now()
-      const result = await this.ollamaService.chat({ ...ollamaRequest, think, numCtx, keepAlive, maxTokens })
-      if (result?.message?.content) {
-        result.message.content = this.chatOrchestratorService.sanitizeAssistantContent(result.message.content)
-      }
-      const chatMs = Date.now() - chatStart
+      const { result, chatMs } = await this.chatOrchestratorService.executeChat({
+        ...ollamaRequest,
+        think,
+        numCtx,
+        keepAlive,
+        maxTokens,
+      })
 
       await this.chatOrchestratorService.saveAssistantReply({
         sessionId: sessionId ?? null,
