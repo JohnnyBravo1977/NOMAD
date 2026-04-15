@@ -8,12 +8,9 @@ import { modelNameSchema } from '#validators/download'
 import { chatSchema, getAvailableModelsSchema } from '#validators/ollama'
 import { inject } from '@adonisjs/core'
 import type { HttpContext } from '@adonisjs/core/http'
-import { DEFAULT_QUERY_REWRITE_MODEL, RAG_CONTEXT_LIMITS, SYSTEM_PROMPTS } from '../../constants/ollama.js'
+import { SYSTEM_PROMPTS } from '../../constants/ollama.js'
 import { SERVICE_NAMES } from '../../constants/service_names.js'
 import logger from '@adonisjs/core/services/logger'
-import { appendFile, mkdir } from 'fs/promises'
-import path from 'node:path'
-type Message = { role: 'system' | 'user' | 'assistant'; content: string }
 
 @inject()
 export default class OllamaController {
@@ -108,8 +105,8 @@ export default class OllamaController {
         lastUserText,
         model: reqData.model,
         ragService: this.ragService,
-        rewriteQuery: (messages) => this.rewriteQueryWithContext(messages),
-        getContextLimitsForModel: (modelName) => this.getContextLimitsForModel(modelName),
+        rewriteQuery: (messages) => this.chatOrchestratorService.rewriteQueryWithContext(messages),
+        getContextLimitsForModel: (modelName) => this.chatOrchestratorService.getContextLimitsForModel(modelName),
         buildRagPrompt: (context) => SYSTEM_PROMPTS.rag_context(context),
       })
       lastUserText = knowledgePlan.lastUserText
@@ -146,7 +143,7 @@ export default class OllamaController {
       const { sessionId, ...ollamaRequest } = reqData
 
       // Optional prompt logging for debugging performance issues
-      await this.logPromptIfEnabled({
+      await this.chatOrchestratorService.logPromptIfEnabled({
         timestamp: new Date().toISOString(),
         model: reqData.model,
         sessionId: sessionId ?? null,
@@ -193,7 +190,7 @@ export default class OllamaController {
           chatMs: streamResult.chatMs,
         }
         console.log('[ChatPerf]', JSON.stringify(perfPayload))
-        await this.logChatPerfIfEnabled(perfPayload)
+        await this.chatOrchestratorService.logChatPerfIfEnabled(perfPayload)
         return
       }
 
@@ -227,7 +224,7 @@ export default class OllamaController {
         chatMs,
       }
       console.log('[ChatPerf]', JSON.stringify(perfPayload))
-      await this.logChatPerfIfEnabled(perfPayload)
+      await this.chatOrchestratorService.logChatPerfIfEnabled(perfPayload)
       return result
     } catch (error) {
       if (reqData.stream) {
@@ -338,124 +335,4 @@ export default class OllamaController {
     return await this.ollamaService.getModels()
   }
 
-  /**
-   * Determines RAG context limits based on model size extracted from the model name.
-   * Parses size indicators like "1b", "3b", "8b", "70b" from model names/tags.
-   */
-  private getContextLimitsForModel(modelName: string): { maxResults: number; maxTokens: number } {
-    // Extract parameter count from model name (e.g., "llama3.2:3b", "qwen2.5:1.5b", "gemma:7b")
-    const sizeMatch = modelName.match(/(\d+\.?\d*)[bB]/)
-    const paramBillions = sizeMatch ? parseFloat(sizeMatch[1]) : 8 // default to 8B if unknown
-
-    for (const tier of RAG_CONTEXT_LIMITS) {
-      if (paramBillions <= tier.maxParams) {
-        return { maxResults: tier.maxResults, maxTokens: tier.maxTokens }
-      }
-    }
-
-    // Fallback: no limits
-    return { maxResults: 5, maxTokens: 0 }
-  }
-
-  private async rewriteQueryWithContext(
-    messages: Message[]
-  ): Promise<string | null> {
-    try {
-      // Get recent conversation history (last 6 messages for 3 turns)
-      const recentMessages = messages.slice(-6)
-
-      // Skip rewriting for short conversations. Rewriting adds latency with
-      // little RAG benefit until there is enough context to matter.
-      const userMessages = recentMessages.filter(msg => msg.role === 'user')
-      if (userMessages.length <= 2) {
-        return userMessages[userMessages.length - 1]?.content || null
-      }
-
-      const conversationContext = recentMessages
-        .map(msg => {
-          const role = msg.role === 'user' ? 'User' : 'Assistant'
-          // Truncate assistant messages to first 200 chars to keep context manageable
-          const content = msg.role === 'assistant'
-            ? msg.content.slice(0, 200) + (msg.content.length > 200 ? '...' : '')
-            : msg.content
-          return `${role}: "${content}"`
-        })
-        .join('\n')
-
-      const installedModels = await this.ollamaService.getModels(true)
-      const rewriteModelAvailable = installedModels?.some(model => model.name === DEFAULT_QUERY_REWRITE_MODEL)
-      if (!rewriteModelAvailable) {
-        logger.warn(`[RAG] Query rewrite model "${DEFAULT_QUERY_REWRITE_MODEL}" not available. Skipping query rewriting.`)
-        const lastUserMessage = [...messages].reverse().find(msg => msg.role === 'user')
-        return lastUserMessage?.content || null
-      }
-
-      // FUTURE ENHANCEMENT: allow the user to specify which model to use for rewriting
-      const response = await this.ollamaService.chat({
-        model: DEFAULT_QUERY_REWRITE_MODEL,
-        messages: [
-          {
-            role: 'system',
-            content: SYSTEM_PROMPTS.query_rewrite,
-          },
-          {
-            role: 'user',
-            content: `Conversation:\n${conversationContext}\n\nRewritten Query:`,
-          },
-        ],
-      })
-
-      const rewrittenQuery = response.message.content.trim()
-      logger.info(`[RAG] Query rewritten: "${rewrittenQuery}"`)
-      return rewrittenQuery
-    } catch (error) {
-      logger.error(
-        `[RAG] Query rewriting failed: ${error instanceof Error ? error.message : error}`
-      )
-      // Fallback to last user message if rewriting fails
-      const lastUserMessage = [...messages].reverse().find(msg => msg.role === 'user')
-      return lastUserMessage?.content || null
-    }
-  }
-
-  private async logPromptIfEnabled(payload: {
-    timestamp: string
-    model: string
-    sessionId: number | null
-    think: boolean | 'medium'
-    numCtx: number | null
-    messages: Message[]
-  }) {
-    if (!process.env.NOMAD_PROMPT_LOG) return
-    try {
-      const logPath = path.join(process.cwd(), 'storage', 'logs', 'prompt.log')
-      await mkdir(path.dirname(logPath), { recursive: true })
-      await appendFile(logPath, JSON.stringify(payload) + '\n', 'utf-8')
-    } catch (err: any) {
-      logger.error(`[OllamaController] Failed to write prompt log: ${err?.message || err}`)
-    }
-  }
-
-  private async logChatPerfIfEnabled(payload: {
-    timestamp: string
-    model: string
-    sessionId: number | null
-    stream: boolean
-    think: boolean | 'medium'
-    numCtx: number | null
-    messageLength: number
-    rewriteMs: number
-    ragMs: number
-    ragDocsCount: number
-    ttfbMs: number | null
-    totalMs: number
-    chatMs?: number
-  }) {
-    if (!process.env.NOMAD_CHAT_PERF_LOG) return
-    try {
-      logger.info(`[ChatPerf] ${JSON.stringify(payload)}`)
-    } catch (err: any) {
-      logger.error(`[OllamaController] Failed to write chat perf log: ${err?.message || err}`)
-    }
-  }
 }

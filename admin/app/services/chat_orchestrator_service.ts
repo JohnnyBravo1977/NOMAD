@@ -5,7 +5,9 @@ import KVStore from '#models/kv_store'
 import { RagService } from '#services/rag_service'
 import { ChatService } from '#services/chat_service'
 import { OllamaService } from '#services/ollama_service'
-import { mkdir, writeFile } from 'fs/promises'
+import { appendFile, mkdir, writeFile } from 'fs/promises'
+import logger from '@adonisjs/core/services/logger'
+import { DEFAULT_QUERY_REWRITE_MODEL, RAG_CONTEXT_LIMITS, SYSTEM_PROMPTS } from '../../constants/ollama.js'
 
 type Message = { role: 'system' | 'user' | 'assistant'; content: string }
 
@@ -70,6 +72,76 @@ export class ChatOrchestratorService {
     private chatService: ChatService,
     private ollamaService: OllamaService
   ) {}
+
+  getContextLimitsForModel(modelName: string): { maxResults: number; maxTokens: number } {
+    const sizeMatch = modelName.match(/(\d+\.?\d*)[bB]/)
+    const paramBillions = sizeMatch ? parseFloat(sizeMatch[1]) : 8
+
+    for (const tier of RAG_CONTEXT_LIMITS) {
+      if (paramBillions <= tier.maxParams) {
+        return { maxResults: tier.maxResults, maxTokens: tier.maxTokens }
+      }
+    }
+
+    return { maxResults: 5, maxTokens: 0 }
+  }
+
+  async rewriteQueryWithContext(messages: Message[]): Promise<string | null> {
+    try {
+      const recentMessages = messages.slice(-6)
+      const userMessages = recentMessages.filter((msg) => msg.role === 'user')
+      if (userMessages.length <= 2) {
+        return userMessages[userMessages.length - 1]?.content || null
+      }
+
+      const conversationContext = recentMessages
+        .map((msg) => {
+          const role = msg.role === 'user' ? 'User' : 'Assistant'
+          const content =
+            msg.role === 'assistant'
+              ? msg.content.slice(0, 200) + (msg.content.length > 200 ? '...' : '')
+              : msg.content
+          return `${role}: "${content}"`
+        })
+        .join('\n')
+
+      const installedModels = await this.ollamaService.getModels(true)
+      const rewriteModelAvailable = installedModels?.some(
+        (model) => model.name === DEFAULT_QUERY_REWRITE_MODEL
+      )
+      if (!rewriteModelAvailable) {
+        logger.warn(
+          `[RAG] Query rewrite model "${DEFAULT_QUERY_REWRITE_MODEL}" not available. Skipping query rewriting.`
+        )
+        const lastUserMessage = [...messages].reverse().find((msg) => msg.role === 'user')
+        return lastUserMessage?.content || null
+      }
+
+      const response = await this.ollamaService.chat({
+        model: DEFAULT_QUERY_REWRITE_MODEL,
+        messages: [
+          {
+            role: 'system',
+            content: SYSTEM_PROMPTS.query_rewrite,
+          },
+          {
+            role: 'user',
+            content: `Conversation:\n${conversationContext}\n\nRewritten Query:`,
+          },
+        ],
+      })
+
+      const rewrittenQuery = response.message.content.trim()
+      logger.info(`[RAG] Query rewritten: "${rewrittenQuery}"`)
+      return rewrittenQuery
+    } catch (error) {
+      logger.error(
+        `[RAG] Query rewriting failed: ${error instanceof Error ? error.message : error}`
+      )
+      const lastUserMessage = [...messages].reverse().find((msg) => msg.role === 'user')
+      return lastUserMessage?.content || null
+    }
+  }
 
   async preparePersonalization(args: {
     messages: Message[]
@@ -513,6 +585,49 @@ export class ChatOrchestratorService {
     return {
       result,
       chatMs: Date.now() - chatStart,
+    }
+  }
+
+  async logPromptIfEnabled(payload: {
+    timestamp: string
+    model: string
+    sessionId: number | null
+    think: boolean | 'medium'
+    numCtx: number | null
+    messages: Message[]
+  }) {
+    if (!process.env.NOMAD_PROMPT_LOG) return
+    try {
+      const logPath = path.join(process.cwd(), 'storage', 'logs', 'prompt.log')
+      await mkdir(path.dirname(logPath), { recursive: true })
+      await appendFile(logPath, JSON.stringify(payload) + '\n', 'utf-8')
+    } catch (err: any) {
+      logger.error(`[ChatOrchestratorService] Failed to write prompt log: ${err?.message || err}`)
+    }
+  }
+
+  async logChatPerfIfEnabled(payload: {
+    timestamp: string
+    model: string
+    sessionId: number | null
+    stream: boolean
+    think: boolean | 'medium'
+    numCtx: number | null
+    messageLength: number
+    rewriteMs: number
+    ragMs: number
+    ragDocsCount: number
+    ttfbMs: number | null
+    totalMs: number
+    chatMs?: number
+  }) {
+    if (!process.env.NOMAD_CHAT_PERF_LOG) return
+    try {
+      logger.info(`[ChatPerf] ${JSON.stringify(payload)}`)
+    } catch (err: any) {
+      logger.error(
+        `[ChatOrchestratorService] Failed to write chat perf log: ${err?.message || err}`
+      )
     }
   }
 }
