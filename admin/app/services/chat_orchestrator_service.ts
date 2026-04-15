@@ -37,6 +37,23 @@ type DirectAnswerPlan = {
   content: string
 } | null
 
+type StreamChunk = {
+  message?: {
+    content?: string
+    thinking?: string
+    [key: string]: any
+  }
+  [key: string]: any
+}
+
+type StreamingReplyState = {
+  fullContent: string
+  firstChunkAt: number | null
+  droppingReasoning: boolean
+  dropBuffer: string
+  dropFence: boolean
+}
+
 @inject()
 export class ChatOrchestratorService {
   constructor(private chatService: ChatService) {}
@@ -365,6 +382,91 @@ export class ChatOrchestratorService {
         )
       })
     }
+  }
+
+  createStreamingReplyState(): StreamingReplyState {
+    return {
+      fullContent: '',
+      firstChunkAt: null,
+      droppingReasoning: false,
+      dropBuffer: '',
+      dropFence: false,
+    }
+  }
+
+  processStreamingChunk(
+    state: StreamingReplyState,
+    chunk: StreamChunk
+  ): { state: StreamingReplyState; outgoingChunk: StreamChunk } {
+    let chunkContent = chunk.message?.content ?? ''
+
+    if (chunkContent) {
+      if (!state.droppingReasoning) {
+        const trimmed = chunkContent.trimStart()
+        if (
+          trimmed.startsWith('```') &&
+          (trimmed.toLowerCase().includes('reason') || trimmed.toLowerCase().includes('thinking'))
+        ) {
+          state.droppingReasoning = true
+          state.dropFence = true
+          state.dropBuffer += chunkContent
+          chunkContent = ''
+        } else if (/^(reasoning|thinking process)\s*[:\-]*\s*/i.test(trimmed)) {
+          state.droppingReasoning = true
+          state.dropFence = false
+          state.dropBuffer += chunkContent
+          chunkContent = ''
+        }
+      } else {
+        state.dropBuffer += chunkContent
+        chunkContent = ''
+      }
+
+      if (state.droppingReasoning) {
+        if (state.dropFence) {
+          const fenceEnd = state.dropBuffer.indexOf('```', 3)
+          if (fenceEnd !== -1) {
+            const remaining = state.dropBuffer.slice(fenceEnd + 3)
+            state.dropBuffer = ''
+            state.droppingReasoning = false
+            state.dropFence = false
+            chunkContent = remaining
+          }
+        } else {
+          const blankIdx = state.dropBuffer.search(/\n\s*\n/)
+          if (blankIdx !== -1) {
+            const remaining = state.dropBuffer.slice(blankIdx)
+            state.dropBuffer = ''
+            state.droppingReasoning = false
+            chunkContent = remaining
+          }
+        }
+      }
+    }
+
+    if (chunkContent) {
+      chunkContent = this.sanitizeAssistantContent(chunkContent)
+      if (chunkContent) {
+        state.fullContent += chunkContent
+      }
+    }
+
+    if (state.firstChunkAt === null && (chunk.message?.content || chunk.message?.thinking)) {
+      state.firstChunkAt = Date.now()
+    }
+
+    const outgoingChunk =
+      chunkContent !== chunk.message?.content
+        ? {
+            ...chunk,
+            message: {
+              ...chunk.message,
+              content: chunkContent,
+            },
+          }
+        : chunk
+
+    return { state, outgoingChunk }
   }
 }
 

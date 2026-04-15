@@ -163,69 +163,10 @@ export default class OllamaController {
         // Headers already flushed above
         const chatStart = Date.now()
         const stream = await this.ollamaService.chatStream({ ...ollamaRequest, think, numCtx, keepAlive, maxTokens })
-        let fullContent = ''
-        let firstChunkAt: number | null = null
-        let droppingReasoning = false
-        let dropBuffer = ''
-        let dropFence = false
+        const streamingState = this.chatOrchestratorService.createStreamingReplyState()
         for await (const chunk of stream) {
-          let chunkContent = chunk.message?.content ?? ''
-
-          if (chunkContent) {
-            if (!droppingReasoning) {
-              const trimmed = chunkContent.trimStart()
-              if (trimmed.startsWith('```') && (trimmed.toLowerCase().includes('reason') || trimmed.toLowerCase().includes('thinking'))) {
-                droppingReasoning = true
-                dropFence = true
-                dropBuffer += chunkContent
-                chunkContent = ''
-              } else if (/^(reasoning|thinking process)\s*[:\-]*\s*/i.test(trimmed)) {
-                droppingReasoning = true
-                dropFence = false
-                dropBuffer += chunkContent
-                chunkContent = ''
-              }
-            } else {
-              dropBuffer += chunkContent
-              chunkContent = ''
-            }
-
-            if (droppingReasoning) {
-              if (dropFence) {
-                const fenceEnd = dropBuffer.indexOf('```', 3)
-                if (fenceEnd !== -1) {
-                  const remaining = dropBuffer.slice(fenceEnd + 3)
-                  dropBuffer = ''
-                  droppingReasoning = false
-                  dropFence = false
-                  chunkContent = remaining
-                }
-              } else {
-                const blankIdx = dropBuffer.search(/\n\s*\n/)
-                if (blankIdx !== -1) {
-                  const remaining = dropBuffer.slice(blankIdx)
-                  dropBuffer = ''
-                  droppingReasoning = false
-                  chunkContent = remaining
-                }
-              }
-            }
-          }
-
-          if (chunkContent) {
-            chunkContent = this.chatOrchestratorService.sanitizeAssistantContent(chunkContent)
-          }
-          if (chunkContent) {
-            fullContent += chunkContent
-          }
-          if (firstChunkAt === null && (chunk.message?.content || chunk.message?.thinking)) {
-            firstChunkAt = Date.now()
-          }
-          if (chunkContent !== chunk.message?.content) {
-            response.response.write(`data: ${JSON.stringify({ ...chunk, message: { ...chunk.message, content: chunkContent } })}\n\n`)
-          } else {
-            response.response.write(`data: ${JSON.stringify(chunk)}\n\n`)
-          }
+          const { outgoingChunk } = this.chatOrchestratorService.processStreamingChunk(streamingState, chunk)
+          response.response.write(`data: ${JSON.stringify(outgoingChunk)}\n\n`)
         }
         response.response.end()
         const chatMs = Date.now() - chatStart
@@ -234,7 +175,7 @@ export default class OllamaController {
         await this.chatOrchestratorService.saveAssistantReply({
           sessionId: sessionId ?? null,
           userContent,
-          assistantContent: fullContent,
+          assistantContent: streamingState.fullContent,
         })
         const perfPayload = {
           timestamp: new Date().toISOString(),
@@ -247,7 +188,7 @@ export default class OllamaController {
           rewriteMs,
           ragMs,
           ragDocsCount,
-          ttfbMs: firstChunkAt ? firstChunkAt - chatStart : null,
+          ttfbMs: streamingState.firstChunkAt ? streamingState.firstChunkAt - chatStart : null,
           totalMs: Date.now() - perfStart,
           chatMs,
         }
