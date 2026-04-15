@@ -5,6 +5,8 @@ type HaTask =
   | { kind: 'list_entities' }
   | { kind: 'get_state'; entityRef: string }
   | { kind: 'call_service'; domain: string; service: string; data: Record<string, any> }
+  | { kind: 'call_service_group'; domain: string; service: string; entityRefs: string[] }
+  | { kind: 'house_summary' }
 
 type HaState = {
   entity_id: string
@@ -36,6 +38,10 @@ export class HomeAssistantWorkerService {
         return this.getEntityState(task.entityRef)
       case 'call_service':
         return this.callService(task.domain, task.service, task.data)
+      case 'call_service_group':
+        return this.callGroupService(task.domain, task.service, task.entityRefs)
+      case 'house_summary':
+        return this.getHouseSummary()
       default:
         return null
     }
@@ -47,6 +53,12 @@ export class HomeAssistantWorkerService {
 
     if (/\b(home assistant|ha)\b/i.test(text) && /\b(list|show).*(entities|devices|states)\b/i.test(text)) {
       return { kind: 'list_entities' }
+    }
+
+    if (
+      /\b(house status|status of the house|status of house|house summary|summary of the house)\b/i.test(text)
+    ) {
+      return { kind: 'house_summary' }
     }
 
     if (/\bshopping list\b/i.test(text) && /\badd\b/i.test(text)) {
@@ -154,6 +166,20 @@ export class HomeAssistantWorkerService {
       const action = match[1].toLowerCase()
       const target = this.cleanEntityReference(match[2])
       if (!target) return null
+      if (action === 'lock' && /\bhouse\b/i.test(target)) {
+        return { kind: 'call_service_group', domain: 'lock', service: 'lock', entityRefs: ['mock front door'] }
+      }
+      if (action === 'unlock' && /\bhouse\b/i.test(target)) {
+        return { kind: 'call_service_group', domain: 'lock', service: 'unlock', entityRefs: ['mock front door'] }
+      }
+      if ((action === 'turn on' || action === 'turn off') && /\ball\b.*\bmock light/.test(this.normalizeText(target))) {
+        return {
+          kind: 'call_service_group',
+          domain: 'homeassistant',
+          service: action === 'turn on' ? 'turn_on' : 'turn_off',
+          entityRefs: ['mock porch light'],
+        }
+      }
       if (action === 'turn on') {
         return { kind: 'call_service', domain: 'homeassistant', service: 'turn_on', data: { entity_ref: target } }
       }
@@ -212,6 +238,59 @@ export class HomeAssistantWorkerService {
     }
 
     return `Home Assistant service ${domain}.${service} completed.\n${this.describeState(state)}`
+  }
+
+  private async callGroupService(
+    domain: string,
+    service: string,
+    entityRefs: string[]
+  ): Promise<string> {
+    const resolved = await Promise.all(
+      entityRefs.map(async (entityRef) => ({
+        entityRef,
+        entityId: await this.resolveEntityIdForService(domain, { entity_ref: entityRef }),
+      }))
+    )
+
+    const entityIds = resolved
+      .map((entry) => entry.entityId)
+      .filter((value): value is string => typeof value === 'string' && value.length > 0)
+
+    if (!entityIds.length) {
+      return `I couldn't find any matching Home Assistant entities for that request.`
+    }
+
+    await this.homeAssistantService.callService(domain, service, { entity_id: entityIds })
+
+    const states = await Promise.all(entityIds.map((entityId) => this.homeAssistantService.getState(entityId)))
+    const descriptions = states.filter(Boolean).map((state) => this.describeState(state!))
+
+    return `Home Assistant service ${domain}.${service} completed for ${entityIds.length} entr${entityIds.length === 1 ? 'y' : 'ies'}.\n${descriptions.join('\n\n')}`
+  }
+
+  private async getHouseSummary(): Promise<string> {
+    const targets = [
+      'mock front door',
+      'mock porch light',
+      'mock sprinklers',
+      'mock thermostat target temperature',
+      'mock thermostat mode',
+      'mock living room temperature',
+      'mock living room humidity',
+      'mock water pressure',
+      'mock tank level',
+      'mock water main open',
+      'mock water supply alert',
+    ]
+
+    const states = await Promise.all(targets.map((target) => this.findBestEntityMatch(target)))
+    const lines = states.filter(Boolean).map((state) => this.describeState(state!))
+
+    if (!lines.length) {
+      return `I couldn't build a house summary because the mock Home Assistant entities are missing.`
+    }
+
+    return `House status summary:\n${lines.join('\n\n')}`
   }
 
   private describeState(state: { entity_id: string; state: string; attributes?: Record<string, any> }): string {
