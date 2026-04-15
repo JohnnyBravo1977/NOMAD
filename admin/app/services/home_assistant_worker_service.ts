@@ -7,6 +7,7 @@ type HaTask =
   | { kind: 'call_service'; domain: string; service: string; data: Record<string, any> }
   | { kind: 'call_service_group'; domain: string; service: string; entityRefs: string[] }
   | { kind: 'house_summary' }
+  | { kind: 'house_attention' }
 
 type HaState = {
   entity_id: string
@@ -42,6 +43,8 @@ export class HomeAssistantWorkerService {
         return this.callGroupService(task.domain, task.service, task.entityRefs)
       case 'house_summary':
         return this.getHouseSummary()
+      case 'house_attention':
+        return this.getHouseAttentionSummary()
       default:
         return null
     }
@@ -59,6 +62,10 @@ export class HomeAssistantWorkerService {
       /\b(house status|status of the house|status of house|house summary|summary of the house)\b/i.test(text)
     ) {
       return { kind: 'house_summary' }
+    }
+
+    if (/\b(what needs attention in the house|house attention|what needs attention at home)\b/i.test(text)) {
+      return { kind: 'house_attention' }
     }
 
     if (/\bshopping list\b/i.test(text) && /\badd\b/i.test(text)) {
@@ -166,18 +173,44 @@ export class HomeAssistantWorkerService {
       const action = match[1].toLowerCase()
       const target = this.cleanEntityReference(match[2])
       if (!target) return null
-      if (action === 'lock' && /\bhouse\b/i.test(target)) {
+      const normalizedTarget = this.normalizeText(target)
+      if (action === 'lock' && (/\bhouse\b/i.test(target) || /\ball\b.*\bdoor\b/.test(normalizedTarget))) {
         return { kind: 'call_service_group', domain: 'lock', service: 'lock', entityRefs: ['mock front door'] }
       }
-      if (action === 'unlock' && /\bhouse\b/i.test(target)) {
+      if (action === 'unlock' && (/\bhouse\b/i.test(target) || /\ball\b.*\bdoor\b/.test(normalizedTarget))) {
         return { kind: 'call_service_group', domain: 'lock', service: 'unlock', entityRefs: ['mock front door'] }
       }
-      if ((action === 'turn on' || action === 'turn off') && /\ball\b.*\bmock light/.test(this.normalizeText(target))) {
+      if (
+        (action === 'turn on' || action === 'turn off') &&
+        (/\ball\b.*\blight\b/.test(normalizedTarget) || /\ball\b.*\bmock light\b/.test(normalizedTarget))
+      ) {
         return {
           kind: 'call_service_group',
           domain: 'homeassistant',
           service: action === 'turn on' ? 'turn_on' : 'turn_off',
           entityRefs: ['mock porch light'],
+        }
+      }
+      if (
+        action === 'turn off' &&
+        (/\bwater\b/.test(normalizedTarget) || /\bwater main\b/.test(normalizedTarget))
+      ) {
+        return {
+          kind: 'call_service',
+          domain: 'homeassistant',
+          service: 'turn_off',
+          data: { entity_ref: 'mock water main open' },
+        }
+      }
+      if (
+        action === 'turn on' &&
+        (/\bwater\b/.test(normalizedTarget) || /\bwater main\b/.test(normalizedTarget))
+      ) {
+        return {
+          kind: 'call_service',
+          domain: 'homeassistant',
+          service: 'turn_on',
+          data: { entity_ref: 'mock water main open' },
         }
       }
       if (action === 'turn on') {
@@ -291,6 +324,94 @@ export class HomeAssistantWorkerService {
     }
 
     return `House status summary:\n${lines.join('\n\n')}`
+  }
+
+  private async getHouseAttentionSummary(): Promise<string> {
+    const watchedTargets = [
+      'mock front door',
+      'mock porch light',
+      'mock sprinklers',
+      'mock thermostat target temperature',
+      'mock thermostat mode',
+      'mock living room temperature',
+      'mock living room humidity',
+      'mock water pressure',
+      'mock tank level',
+      'mock water main open',
+      'mock water supply alert',
+    ]
+
+    const states = await Promise.all(watchedTargets.map((target) => this.findBestEntityMatch(target)))
+    const stateMap = new Map(
+      states.filter(Boolean).map((state) => [state!.entity_id, state!])
+    )
+
+    const issues: string[] = []
+
+    const frontDoor = stateMap.get('lock.mock_front_door')
+    if (frontDoor?.state !== 'locked') {
+      issues.push('Mock front door is unlocked.')
+    }
+
+    const porchLight = stateMap.get('light.mock_porch_light') || stateMap.get('input_boolean.mock_porch_light')
+    if (porchLight?.state === 'on') {
+      issues.push('Mock porch light is on.')
+    }
+
+    const sprinklers = stateMap.get('switch.mock_sprinklers') || stateMap.get('input_boolean.mock_sprinklers')
+    if (sprinklers?.state === 'on') {
+      issues.push('Mock sprinklers are running.')
+    }
+
+    const waterAlert =
+      stateMap.get('binary_sensor.mock_water_supply_alert') ||
+      stateMap.get('input_boolean.mock_water_supply_alert')
+    if (waterAlert?.state === 'on') {
+      issues.push('Mock water supply alert is active.')
+    }
+
+    const waterMain =
+      stateMap.get('binary_sensor.mock_water_main_open') || stateMap.get('input_boolean.mock_water_main_open')
+    if (waterMain?.state === 'off') {
+      issues.push('Mock water main is shut off.')
+    }
+
+    const temp = Number(
+      stateMap.get('sensor.mock_living_room_temperature')?.state ||
+        stateMap.get('input_number.mock_living_room_temperature')?.state
+    )
+    if (Number.isFinite(temp) && (temp < 60 || temp > 80)) {
+      issues.push(`Mock living room temperature is ${temp}F.`)
+    }
+
+    const humidity = Number(
+      stateMap.get('sensor.mock_living_room_humidity')?.state ||
+        stateMap.get('input_number.mock_living_room_humidity')?.state
+    )
+    if (Number.isFinite(humidity) && (humidity < 25 || humidity > 65)) {
+      issues.push(`Mock living room humidity is ${humidity}%.`)
+    }
+
+    const waterPressure = Number(
+      stateMap.get('sensor.mock_water_pressure')?.state ||
+        stateMap.get('input_number.mock_water_pressure')?.state
+    )
+    if (Number.isFinite(waterPressure) && waterPressure < 20) {
+      issues.push(`Mock water pressure is low at ${waterPressure} psi.`)
+    }
+
+    const tankLevel = Number(
+      stateMap.get('sensor.mock_tank_level')?.state || stateMap.get('input_number.mock_tank_level')?.state
+    )
+    if (Number.isFinite(tankLevel) && tankLevel < 25) {
+      issues.push(`Mock tank level is low at ${tankLevel}%.`)
+    }
+
+    if (!issues.length) {
+      return 'Nothing urgent needs attention in the mock house right now.'
+    }
+
+    return `House attention summary:\n${issues.join('\n')}`
   }
 
   private describeState(state: { entity_id: string; state: string; attributes?: Record<string, any> }): string {
