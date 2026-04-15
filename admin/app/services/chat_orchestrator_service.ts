@@ -6,6 +6,7 @@ import { RagService } from '#services/rag_service'
 import { ChatService } from '#services/chat_service'
 import { OllamaService } from '#services/ollama_service'
 import { EditWorkerService } from '#services/edit_worker_service'
+import { HomeAssistantWorkerService } from '#services/home_assistant_worker_service'
 import { ReadWorkerService } from '#services/read_worker_service'
 import { SystemWorkerService } from '#services/system_worker_service'
 import { appendFile, mkdir, writeFile } from 'fs/promises'
@@ -111,6 +112,7 @@ export class ChatOrchestratorService {
   constructor(
     private chatService: ChatService,
     private ollamaService: OllamaService,
+    private homeAssistantWorkerService: HomeAssistantWorkerService,
     private editWorkerService: EditWorkerService,
     private readWorkerService: ReadWorkerService,
     private systemWorkerService: SystemWorkerService
@@ -527,6 +529,11 @@ export class ChatOrchestratorService {
   }): Promise<DirectAnswerPlan> {
     const { lastUserText, profiles, activeUser, userName, ragService } = args
     try {
+      const homeAssistantAnswer = await this.homeAssistantWorkerService.tryHandle(lastUserText)
+      if (homeAssistantAnswer) {
+        return { content: homeAssistantAnswer }
+      }
+
       const systemWorkerAnswer = await this.systemWorkerService.tryHandle(lastUserText)
       if (systemWorkerAnswer) {
         return { content: systemWorkerAnswer }
