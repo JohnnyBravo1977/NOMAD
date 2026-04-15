@@ -5,6 +5,7 @@ import KVStore from '#models/kv_store'
 import { RagService } from '#services/rag_service'
 import { ChatService } from '#services/chat_service'
 import { OllamaService } from '#services/ollama_service'
+import { EditWorkerService } from '#services/edit_worker_service'
 import { ReadWorkerService } from '#services/read_worker_service'
 import { appendFile, mkdir, writeFile } from 'fs/promises'
 import logger from '@adonisjs/core/services/logger'
@@ -109,6 +110,7 @@ export class ChatOrchestratorService {
   constructor(
     private chatService: ChatService,
     private ollamaService: OllamaService,
+    private editWorkerService: EditWorkerService,
     private readWorkerService: ReadWorkerService
   ) {}
 
@@ -523,6 +525,11 @@ export class ChatOrchestratorService {
   }): Promise<DirectAnswerPlan> {
     const { lastUserText, profiles, activeUser, userName, ragService } = args
     try {
+      const editWorkerAnswer = await this.editWorkerService.tryHandle(lastUserText)
+      if (editWorkerAnswer) {
+        return { content: editWorkerAnswer }
+      }
+
       const readWorkerAnswer = await this.readWorkerService.tryHandle(lastUserText)
       if (readWorkerAnswer) {
         return { content: readWorkerAnswer }
