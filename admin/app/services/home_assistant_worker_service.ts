@@ -43,6 +43,7 @@ export class HomeAssistantWorkerService {
 
   private parseTask(userText: string): HaTask | null {
     const text = userText.trim()
+    let match: RegExpMatchArray | null
 
     if (/\b(home assistant|ha)\b/i.test(text) && /\b(list|show).*(entities|devices|states)\b/i.test(text)) {
       return { kind: 'list_entities' }
@@ -60,7 +61,42 @@ export class HomeAssistantWorkerService {
       }
     }
 
-    let match =
+    match = text.match(/\bset\s+(.+?)\s+to\s+(-?\d+(?:\.\d+)?)\b/i)
+    if (match) {
+      let target = this.cleanEntityReference(match[1])
+      if (/\bthermostat\b/i.test(target) && !/\btarget temperature\b/i.test(target)) {
+        target = `${target} target temperature`
+      }
+      return {
+        kind: 'call_service',
+        domain: 'input_number',
+        service: 'set_value',
+        data: { entity_ref: target, value: Number(match[2]) },
+      }
+    }
+
+    match = text.match(/\bset\s+(.+?)\s+mode\s+to\s+(off|heat|cool|auto)\b/i)
+    if (match) {
+      const target = this.cleanEntityReference(`${match[1]} mode`)
+      return {
+        kind: 'call_service',
+        domain: 'input_select',
+        service: 'select_option',
+        data: { entity_ref: target, option: match[2].toLowerCase() },
+      }
+    }
+
+    match = text.match(/\bset\s+(?:the\s+)?(?:thermostat|mock thermostat)\s+mode\s+to\s+(off|heat|cool|auto)\b/i)
+    if (match) {
+      return {
+        kind: 'call_service',
+        domain: 'input_select',
+        service: 'select_option',
+        data: { entity_ref: 'mock thermostat mode', option: match[1].toLowerCase() },
+      }
+    }
+
+    match =
       text.match(/\b(?:state|status) of (?:entity )?([a-z0-9_]+\.[a-z0-9_]+)\b/i) ||
       text.match(/\bwhat(?:'s| is) the state of (?:entity )?([a-z0-9_]+\.[a-z0-9_]+)\b/i)
     if (match) {
@@ -222,6 +258,10 @@ export class HomeAssistantWorkerService {
     const domainHints =
       domain === 'lock'
         ? ['lock']
+        : domain === 'input_number'
+          ? ['input_number']
+          : domain === 'input_select'
+            ? ['input_select']
         : domain === 'homeassistant'
           ? ['light', 'switch', 'fan', 'cover', 'script', 'scene', 'input_boolean']
           : [domain]
