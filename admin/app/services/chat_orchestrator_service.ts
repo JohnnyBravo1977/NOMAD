@@ -216,6 +216,7 @@ export class ChatOrchestratorService {
 
     const directAnswer = await this.prepareDirectAnswer({
       lastUserText,
+      messages,
       profiles: personalizationPlan.profiles,
       activeUser: personalizationPlan.activeUser,
       userName: personalizationPlan.userName,
@@ -490,7 +491,7 @@ export class ChatOrchestratorService {
     if (!hasSystemMessage) {
       systemMessages.push({
         role: 'system',
-        content: `${baseSystemPrompt}\nCurrent date/time: ${nowText}${tz ? ` (${tz})` : ''}\nYour name is ${assistantName}. If asked your name, answer "I'm ${assistantName} — your assistant here. How can I help today?"${userName ? `\nThe user's name is ${userName}. If asked who the user is, answer "${userName}".` : ''}${activeUser ? `\nYou are currently talking to ${activeUser}.` : ''}`,
+        content: `${baseSystemPrompt}\nCurrent date/time: ${nowText}${tz ? ` (${tz})` : ''}\nYour name is ${assistantName}. If asked your name, answer "I'm ${assistantName} — your assistant here. How can I help today?"${userName ? `\nThe user's name is ${userName}. If asked who the user is, answer "${userName}".` : ''}${activeUser ? `\nYou are currently talking to ${activeUser}.` : ''}\nDo not infer unresolved pronouns like she, he, they, it, this, or that into family members, devices, or tools.\nIf a target is ambiguous, ask a brief clarification or stay conversational.\nNever claim you inspected, listed, read, or changed something unless a real tool result or provided context gave you that information.`,
       })
     }
 
@@ -522,29 +523,31 @@ export class ChatOrchestratorService {
 
   async prepareDirectAnswer(args: {
     lastUserText: string
+    messages: Message[]
     profiles: Record<string, string[]>
     activeUser: string | null
     userName: string | null
     ragService: RagService
   }): Promise<DirectAnswerPlan> {
-    const { lastUserText, profiles, activeUser, userName, ragService } = args
+    const { lastUserText, messages, profiles, activeUser, userName, ragService } = args
+    const groundedText = resolveGroundedFollowUpText(lastUserText, messages)
     try {
-      const homeAssistantAnswer = await this.homeAssistantWorkerService.tryHandle(lastUserText)
+      const homeAssistantAnswer = await this.homeAssistantWorkerService.tryHandle(groundedText)
       if (homeAssistantAnswer) {
         return { content: homeAssistantAnswer }
       }
 
-      const systemWorkerAnswer = await this.systemWorkerService.tryHandle(lastUserText)
+      const systemWorkerAnswer = await this.systemWorkerService.tryHandle(groundedText)
       if (systemWorkerAnswer) {
         return { content: systemWorkerAnswer }
       }
 
-      const editWorkerAnswer = await this.editWorkerService.tryHandle(lastUserText)
+      const editWorkerAnswer = await this.editWorkerService.tryHandle(groundedText)
       if (editWorkerAnswer) {
         return { content: editWorkerAnswer }
       }
 
-      const readWorkerAnswer = await this.readWorkerService.tryHandle(lastUserText)
+      const readWorkerAnswer = await this.readWorkerService.tryHandle(groundedText)
       if (readWorkerAnswer) {
         return { content: readWorkerAnswer }
       }
@@ -1455,6 +1458,39 @@ function isLikelyTransientState(text: string): boolean {
   const lower = text.trim().toLowerCase()
   const blacklist = ['ok', 'okay', 'fine', 'good', 'great', 'tired', 'sleepy', 'hungry', 'thirsty', 'busy', 'bored', 'here', 'there', 'ready', 'done']
   return blacklist.includes(lower)
+}
+
+function resolveGroundedFollowUpText(currentText: string, messages: Message[]): string {
+  const trimmed = currentText.trim()
+  if (!trimmed) return currentText
+
+  const previousUserMessages = messages
+    .filter((message) => message.role === 'user')
+    .map((message) => message.content.trim())
+    .filter(Boolean)
+
+  if (previousUserMessages.length < 2) return currentText
+
+  const isFollowUpText = (value: string): boolean => {
+    const lower = value.trim().toLowerCase()
+    return (
+      /^(the|it|that|this|those|these|just|please)\b/.test(lower) ||
+      /\b(file system|filesystem|directories|directory|folders|folder|files|list them|show them)\b/.test(lower)
+    )
+  }
+
+  if (!isFollowUpText(trimmed)) return currentText
+
+  const chain: string[] = [trimmed]
+  for (let index = previousUserMessages.length - 2; index >= 0; index -= 1) {
+    const candidate = previousUserMessages[index]
+    chain.unshift(candidate)
+    if (!isFollowUpText(candidate)) {
+      return chain.join('\nFollow-up: ')
+    }
+  }
+
+  return chain.join('\nFollow-up: ')
 }
 
 function relationOf(relation: string): string {

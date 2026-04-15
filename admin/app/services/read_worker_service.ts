@@ -8,6 +8,7 @@ type ReadTask =
   | { kind: 'tail_container_logs'; containerName: string }
   | { kind: 'read_file'; filePath: string }
   | { kind: 'list_directory'; dirPath: string }
+  | { kind: 'list_home_assistant_directories' }
   | { kind: 'find_files'; query: string }
   | { kind: 'search_text'; pattern: string; targetPath?: string }
   | { kind: 'check_disk_usage'; targetPath?: string }
@@ -34,6 +35,8 @@ export class ReadWorkerService {
         return this.readTextFile(task.filePath)
       case 'list_directory':
         return this.listDirectory(task.dirPath)
+      case 'list_home_assistant_directories':
+        return this.listHomeAssistantDirectories()
       case 'find_files':
         return this.findFiles(task.query)
       case 'search_text':
@@ -74,6 +77,13 @@ export class ReadWorkerService {
       text.match(/\b(?:list|show)\s+files in\s+(.+)$/i)
     if (match) {
       return { kind: 'list_directory', dirPath: stripWrappingQuotes(match[1]) }
+    }
+
+    if (
+      /\b(home assistant|ha)\b/i.test(text) &&
+      /\b(file system|filesystem|directories|directory structure|folders|config structure|config directories)\b/i.test(text)
+    ) {
+      return { kind: 'list_home_assistant_directories' }
     }
 
     const searchMatch =
@@ -189,6 +199,41 @@ export class ReadWorkerService {
     return names.length > 0
       ? `Contents of ${resolvedPath}:\n${names.join('\n')}`
       : `${resolvedPath} is empty.`
+  }
+
+  private async listHomeAssistantDirectories(): Promise<string> {
+    const container = await this.resolveContainer('homeassistant')
+    if (!container) {
+      return `I couldn't find the Home Assistant container.`
+    }
+
+    const exec = await this.dockerService.docker.getContainer(container.Id).exec({
+      Cmd: ['sh', '-lc', 'find /config -maxdepth 1 -mindepth 1 -type d | sort'],
+      AttachStdout: true,
+      AttachStderr: true,
+      Tty: true,
+    })
+
+    const stream = await exec.start({ Tty: true })
+    const output = await new Promise<string>((resolve, reject) => {
+      let data = ''
+      stream.on('data', (chunk: Buffer) => {
+        data += chunk.toString('utf-8')
+      })
+      stream.on('end', () => resolve(data.trim()))
+      stream.on('error', reject)
+    })
+
+    const lines = output
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+
+    if (lines.length === 0) {
+      return `I checked Home Assistant, but I didn't find any top-level directories under /config.`
+    }
+
+    return `Top-level Home Assistant config directories:\n${lines.join('\n')}`
   }
 
   private async findFiles(query: string): Promise<string> {

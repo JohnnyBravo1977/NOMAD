@@ -23,6 +23,19 @@ export class HomeAssistantWorkerService {
     return /^[a-z0-9_]+\.[a-z0-9_]+$/i.test(value.trim())
   }
 
+  private isAmbiguousReference(value: string): boolean {
+    const normalized = this.normalizeText(value)
+    if (!normalized) return true
+
+    const banned = new Set([
+      'she', 'he', 'they', 'them', 'her', 'him', 'it', 'this', 'that', 'these', 'those',
+      'there', 'here', 'someone', 'somebody', 'something', 'anything', 'everything',
+      'thing', 'stuff', 'one', 'ones',
+    ])
+
+    return banned.has(normalized)
+  }
+
   async tryHandle(userText: string): Promise<string | null> {
     const task = this.parseTask(userText)
     if (!task) return null
@@ -83,6 +96,7 @@ export class HomeAssistantWorkerService {
     match = text.match(/\bset\s+(.+?)\s+to\s+(-?\d+(?:\.\d+)?)\b/i)
     if (match) {
       let target = this.cleanEntityReference(match[1])
+      if (this.isAmbiguousReference(target)) return null
       if (/\bthermostat\b/i.test(target) && !/\btarget temperature\b/i.test(target)) {
         target = `${target} target temperature`
       }
@@ -97,6 +111,7 @@ export class HomeAssistantWorkerService {
     match = text.match(/\bset\s+(.+?)\s+mode\s+to\s+(off|heat|cool|auto)\b/i)
     if (match) {
       const target = this.cleanEntityReference(`${match[1]} mode`)
+      if (this.isAmbiguousReference(target)) return null
       return {
         kind: 'call_service',
         domain: 'input_select',
@@ -127,7 +142,9 @@ export class HomeAssistantWorkerService {
       text.match(/\bwhat(?:'s| is) the state of (.+)\b/i) ||
       text.match(/\bwhat(?:'s| is) the status of (.+)\b/i)
     if (match) {
-      return { kind: 'get_state', entityRef: this.cleanEntityReference(match[1]) }
+      const target = this.cleanEntityReference(match[1])
+      if (this.isAmbiguousReference(target)) return null
+      return { kind: 'get_state', entityRef: target }
     }
 
     match = text.match(/\b(?:turn on|turn off|lock|unlock)\s+([a-z0-9_]+\.[a-z0-9_]+)\b/i)
@@ -173,6 +190,7 @@ export class HomeAssistantWorkerService {
       const action = match[1].toLowerCase()
       const target = this.cleanEntityReference(match[2])
       if (!target) return null
+      if (this.isAmbiguousReference(target)) return null
       const normalizedTarget = this.normalizeText(target)
       if (action === 'lock' && (/\bhouse\b/i.test(target) || /\ball\b.*\bdoor\b/.test(normalizedTarget))) {
         return { kind: 'call_service_group', domain: 'lock', service: 'lock', entityRefs: ['mock front door'] }
