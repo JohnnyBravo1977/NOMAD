@@ -57,33 +57,27 @@ export default class OllamaController {
     }
 
     try {
-      const customName = await KVStore.getValue('ai.assistantCustomName')
-      const assistantName = (customName && customName.trim()) ? customName : 'AI Assistant'
-      const storedPromptRaw = await KVStore.getValue('ai.systemPrompt')
-      const storedPrompt = typeof storedPromptRaw === 'string' ? storedPromptRaw.trim() : ''
-      const baseSystemPrompt = storedPrompt || SYSTEM_PROMPTS.default.trim()
-      const personalizationPlan = await this.chatOrchestratorService.preparePersonalization({
-        messages: reqData.messages,
-        assistantName,
-        baseSystemPrompt,
+      const preparedTurn = await this.chatOrchestratorService.prepareChatTurn({
+        requestData: reqData,
         ragService: this.ragService,
       })
-      let lastUserText = personalizationPlan.lastUserText
-      for (const systemMessage of personalizationPlan.systemMessages) {
-        logger.debug('[OllamaController] Injecting orchestrated system prompt')
-        reqData.messages.unshift(systemMessage)
-      }
-
-      const directAnswer = await this.chatOrchestratorService.prepareDirectAnswer({
+      const {
+        messages,
+        sessionId,
+        ollamaRequest,
         lastUserText,
-        profiles: personalizationPlan.profiles,
-        activeUser: personalizationPlan.activeUser,
-        userName: personalizationPlan.userName,
-        ragService: this.ragService,
-      })
+        rewriteMs,
+        ragMs,
+        ragDocsCount,
+        think,
+        numCtx,
+        keepAlive,
+        maxTokens,
+        directAnswer,
+      } = preparedTurn
+
       if (directAnswer) {
-        const sessionId = reqData.sessionId ?? null
-        const userContent = await this.chatOrchestratorService.saveUserMessage(sessionId, reqData.messages)
+        const userContent = await this.chatOrchestratorService.saveUserMessage(sessionId, messages)
         await this.chatOrchestratorService.saveAssistantReply({
           sessionId,
           userContent,
@@ -97,51 +91,6 @@ export default class OllamaController {
         return { message: { content: directAnswer.content }, done: true, model: reqData.model }
       }
 
-      // Query rewriting for better RAG retrieval with manageable context
-      // Will return user's latest message if no rewriting is needed
-      // Reuse lastUserText for RAG logic
-      const knowledgePlan = await this.chatOrchestratorService.prepareKnowledgeContext({
-        messages: reqData.messages,
-        lastUserText,
-        model: reqData.model,
-        ragService: this.ragService,
-        rewriteQuery: (messages) => this.chatOrchestratorService.rewriteQueryWithContext(messages),
-        getContextLimitsForModel: (modelName) => this.chatOrchestratorService.getContextLimitsForModel(modelName),
-        buildRagPrompt: (context) => SYSTEM_PROMPTS.rag_context(context),
-      })
-      lastUserText = knowledgePlan.lastUserText
-      const rewrittenQuery = knowledgePlan.rewrittenQuery
-      const rewriteMs = knowledgePlan.rewriteMs
-
-      logger.debug(`[OllamaController] Rewritten query for RAG: "${rewrittenQuery}"`)
-      const ragDocsCount = knowledgePlan.ragDocsCount
-      const ragMs = knowledgePlan.ragMs
-      if (knowledgePlan.systemMessage) {
-        const firstNonSystemIndex = reqData.messages.findIndex((msg) => msg.role !== 'system')
-        const insertIndex = firstNonSystemIndex === -1 ? 0 : firstNonSystemIndex
-        reqData.messages.splice(insertIndex, 0, knowledgePlan.systemMessage)
-      }
-
-      const { numCtx, keepAlive, maxTokens } = this.chatOrchestratorService.buildRuntimeSettings({
-        messages: reqData.messages,
-        model: reqData.model,
-        lastUserText,
-        ragDocsCount,
-      })
-
-      // Check if the model supports "thinking" capability for enhanced response generation
-      // If gpt-oss model, it requires a text param for "think" https://docs.ollama.com/api/chat
-      const thinkingCapability = await this.ollamaService.checkModelHasThinking(reqData.model)
-      let think: boolean | 'medium' = false
-      if (reqData.think === true) {
-        think = thinkingCapability
-          ? (reqData.model.startsWith('gpt-oss') ? 'medium' : true)
-          : false
-      }
-
-      // Separate sessionId from the Ollama request payload — Ollama rejects unknown fields
-      const { sessionId, ...ollamaRequest } = reqData
-
       // Optional prompt logging for debugging performance issues
       await this.chatOrchestratorService.logPromptIfEnabled({
         timestamp: new Date().toISOString(),
@@ -149,11 +98,11 @@ export default class OllamaController {
         sessionId: sessionId ?? null,
         think,
         numCtx: numCtx ?? null,
-        messages: reqData.messages,
+        messages,
       })
 
       // Save user message to DB before streaming if sessionId provided
-      const userContent = await this.chatOrchestratorService.saveUserMessage(sessionId ?? null, reqData.messages)
+      const userContent = await this.chatOrchestratorService.saveUserMessage(sessionId, messages)
 
       if (reqData.stream) {
         logger.debug(`[OllamaController] Initiating streaming response for model: "${reqData.model}" with think: ${think}`)

@@ -66,6 +66,34 @@ type ChatExecutionOptions = {
   maxTokens?: number
 }
 
+type ChatRequestInput = {
+  model: string
+  messages: Message[]
+  sessionId?: number | null
+  stream?: boolean
+  think?: boolean
+  [key: string]: any
+}
+
+type PreparedChatTurn = {
+  messages: Message[]
+  sessionId: number | null
+  ollamaRequest: {
+    model: string
+    messages: Message[]
+    [key: string]: any
+  }
+  lastUserText: string
+  rewriteMs: number
+  ragMs: number
+  ragDocsCount: number
+  think: boolean | 'medium'
+  numCtx?: number
+  keepAlive?: string
+  maxTokens?: number
+  directAnswer: DirectAnswerPlan
+}
+
 @inject()
 export class ChatOrchestratorService {
   constructor(
@@ -140,6 +168,97 @@ export class ChatOrchestratorService {
       )
       const lastUserMessage = [...messages].reverse().find((msg) => msg.role === 'user')
       return lastUserMessage?.content || null
+    }
+  }
+
+  async prepareChatTurn(args: {
+    requestData: ChatRequestInput
+    ragService: RagService
+  }): Promise<PreparedChatTurn> {
+    const { requestData, ragService } = args
+    const messages = requestData.messages.map((message) => ({ ...message }))
+
+    const customName = await KVStore.getValue('ai.assistantCustomName')
+    const assistantName = customName && customName.trim() ? customName : 'AI Assistant'
+    const storedPromptRaw = await KVStore.getValue('ai.systemPrompt')
+    const storedPrompt = typeof storedPromptRaw === 'string' ? storedPromptRaw.trim() : ''
+    const baseSystemPrompt = storedPrompt || SYSTEM_PROMPTS.default.trim()
+
+    const personalizationPlan = await this.preparePersonalization({
+      messages,
+      assistantName,
+      baseSystemPrompt,
+      ragService,
+    })
+
+    let lastUserText = personalizationPlan.lastUserText
+    for (const systemMessage of personalizationPlan.systemMessages) {
+      logger.debug('[ChatOrchestratorService] Injecting orchestrated system prompt')
+      messages.unshift(systemMessage)
+    }
+
+    const directAnswer = await this.prepareDirectAnswer({
+      lastUserText,
+      profiles: personalizationPlan.profiles,
+      activeUser: personalizationPlan.activeUser,
+      userName: personalizationPlan.userName,
+      ragService,
+    })
+
+    const knowledgePlan = await this.prepareKnowledgeContext({
+      messages,
+      lastUserText,
+      model: requestData.model,
+      ragService,
+      rewriteQuery: (rewriteMessages) => this.rewriteQueryWithContext(rewriteMessages),
+      getContextLimitsForModel: (modelName) => this.getContextLimitsForModel(modelName),
+      buildRagPrompt: (context) => SYSTEM_PROMPTS.rag_context(context),
+    })
+
+    lastUserText = knowledgePlan.lastUserText
+    logger.debug(`[ChatOrchestratorService] Rewritten query for RAG: "${knowledgePlan.rewrittenQuery}"`)
+
+    if (knowledgePlan.systemMessage) {
+      const firstNonSystemIndex = messages.findIndex((msg) => msg.role !== 'system')
+      const insertIndex = firstNonSystemIndex === -1 ? 0 : firstNonSystemIndex
+      messages.splice(insertIndex, 0, knowledgePlan.systemMessage)
+    }
+
+    const { numCtx, keepAlive, maxTokens } = this.buildRuntimeSettings({
+      messages,
+      model: requestData.model,
+      lastUserText,
+      ragDocsCount: knowledgePlan.ragDocsCount,
+    })
+
+    const thinkingCapability = await this.ollamaService.checkModelHasThinking(requestData.model)
+    let think: boolean | 'medium' = false
+    if (requestData.think === true) {
+      think = thinkingCapability
+        ? requestData.model.startsWith('gpt-oss')
+          ? 'medium'
+          : true
+        : false
+    }
+
+    const { sessionId, ...restRequest } = requestData
+
+    return {
+      messages,
+      sessionId: sessionId ?? null,
+      ollamaRequest: {
+        ...restRequest,
+        messages,
+      },
+      lastUserText,
+      rewriteMs: knowledgePlan.rewriteMs,
+      ragMs: knowledgePlan.ragMs,
+      ragDocsCount: knowledgePlan.ragDocsCount,
+      think,
+      numCtx,
+      keepAlive,
+      maxTokens,
+      directAnswer,
     }
   }
 
