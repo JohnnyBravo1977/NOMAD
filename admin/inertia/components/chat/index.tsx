@@ -11,6 +11,7 @@ import classNames from '~/lib/classNames'
 import { IconX } from '@tabler/icons-react'
 import { DEFAULT_QUERY_REWRITE_MODEL } from '../../../constants/ollama'
 import { useSystemSetting } from '~/hooks/useSystemSetting'
+import { useNotifications } from '~/context/NotificationContext'
 
 interface ChatProps {
   enabled: boolean
@@ -29,6 +30,7 @@ export default function Chat({
 }: ChatProps) {
   const queryClient = useQueryClient()
   const { openModal, closeAllModals } = useModals()
+  const { addNotification } = useNotifications()
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [selectedModel, setSelectedModel] = useState<string>('')
@@ -61,12 +63,22 @@ export default function Chat({
 
   const { data: lastModelSetting } = useSystemSetting({ key: 'chat.lastModel', enabled })
   const { data: remoteOllamaUrlSetting } = useSystemSetting({ key: 'ai.remoteOllamaUrl', enabled })
+  const { data: systemPromptSetting } = useSystemSetting({ key: 'ai.systemPrompt', enabled })
+  const [promptEditorOpen, setPromptEditorOpen] = useState(false)
+  const [promptDraft, setPromptDraft] = useState('')
 
   const { data: remoteStatus } = useQuery({
     queryKey: ['remoteOllamaStatus'],
     queryFn: () => api.getRemoteOllamaStatus(),
     enabled: enabled && !!remoteOllamaUrlSetting?.value,
     refetchInterval: 15000,
+  })
+
+  const { data: defaultPromptData } = useQuery({
+    queryKey: ['defaultSystemPrompt'],
+    queryFn: () => api.getDefaultSystemPrompt(),
+    enabled: enabled && promptEditorOpen,
+    staleTime: Infinity,
   })
 
   const { data: installedModels = [], isLoading: isLoadingModels } = useQuery({
@@ -90,6 +102,22 @@ export default function Chat({
   const rewriteModelAvailable = useMemo(() => {
     return installedModels.some(model => model.name === DEFAULT_QUERY_REWRITE_MODEL)
   }, [installedModels])
+
+  const currentPrompt: string =
+    typeof systemPromptSetting?.value === 'string' ? systemPromptSetting.value : ''
+
+  const savePromptMutation = useMutation({
+    mutationFn: async (next: string) => {
+      await api.updateSetting('ai.systemPrompt', next)
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['system-setting', 'ai.systemPrompt'] })
+      addNotification({ type: 'success', message: 'System prompt saved' })
+    },
+    onError: () => {
+      addNotification({ type: 'error', message: 'Failed to save system prompt' })
+    },
+  })
 
   const deleteAllSessionsMutation = useMutation({
     mutationFn: () => api.deleteAllChatSessions(),
@@ -162,6 +190,16 @@ export default function Chat({
       localStorage.setItem('nomad:chat-thinking-enabled', String(thinkingEnabled))
     } catch {}
   }, [thinkingEnabled])
+
+  useEffect(() => {
+    if (!promptEditorOpen) return
+    if (currentPrompt) {
+      setPromptDraft(currentPrompt)
+      return
+    }
+    const fallback = defaultPromptData?.prompt
+    if (fallback) setPromptDraft(fallback)
+  }, [promptEditorOpen, currentPrompt, defaultPromptData?.prompt])
 
   const handleNewChat = useCallback(() => {
     // Just clear the active session and messages - don't create a session yet
@@ -370,6 +408,39 @@ export default function Chat({
     [activeSessionId, messages, selectedModel, chatMutation, queryClient, streamingEnabled, thinkingEnabled]
   )
 
+  const handleStopMessage = useCallback(() => {
+    if (streamAbortRef.current) {
+      streamAbortRef.current.abort()
+      streamAbortRef.current = null
+      addNotification({ type: 'success', message: 'Response stopped' })
+    }
+    setIsStreamingResponse(false)
+  }, [addNotification])
+
+  const handleModelChange = useCallback(
+    async (nextModel: string) => {
+      setSelectedModel(nextModel)
+
+      if (!activeSessionId) {
+        return
+      }
+
+      try {
+        await api.updateChatSession(activeSessionId, { model: nextModel })
+        queryClient.invalidateQueries({ queryKey: ['chatSessions'] })
+      } catch (error) {
+        addNotification({ type: 'error', message: 'Failed to save chat model selection' })
+      }
+    },
+    [activeSessionId, queryClient, addNotification]
+  )
+
+  const promptDirty = useMemo(() => {
+    // Treat an unset custom prompt as equivalent to default prompt (when we have it).
+    const effectiveCurrent = currentPrompt || defaultPromptData?.prompt || ''
+    return promptDraft !== effectiveCurrent
+  }, [promptDraft, currentPrompt, defaultPromptData?.prompt])
+
   return (
     <div
       className={classNames(
@@ -437,7 +508,7 @@ export default function Chat({
                 <select
                   id="model-select"
                   value={selectedModel}
-                  onChange={(e) => setSelectedModel(e.target.value)}
+                  onChange={(e) => void handleModelChange(e.target.value)}
                   className="px-3 py-1.5 border border-border-default rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-desert-green focus:border-transparent bg-surface-primary"
                 >
                   {installedModels.map((model) => (
@@ -448,6 +519,18 @@ export default function Chat({
                 </select>
               )}
             </div>
+            <button
+              type="button"
+              onClick={() => setPromptEditorOpen((v) => !v)}
+              className={classNames(
+                'px-3 py-1.5 border rounded-lg text-sm transition-colors',
+                promptEditorOpen
+                  ? 'border-desert-green bg-surface-primary text-text-primary'
+                  : 'border-border-default bg-surface-primary text-text-secondary hover:bg-surface-secondary'
+              )}
+            >
+              Prompt
+            </button>
             {isInModal && (
               <button
                 onClick={() => {
@@ -462,9 +545,69 @@ export default function Chat({
             )}
           </div>
         </div>
+        {promptEditorOpen && (
+          <div className="border-b border-border-subtle bg-surface-primary px-6 py-4">
+            <div className="flex items-start justify-between gap-4">
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2 mb-2">
+                  <div className="text-sm font-medium text-text-primary">System Prompt</div>
+                  <div className="text-xs text-text-muted">
+                    Used for all chats (saved as <span className="font-mono">ai.systemPrompt</span>)
+                  </div>
+                </div>
+                <textarea
+                  value={promptDraft}
+                  onChange={(e) => setPromptDraft(e.target.value)}
+                  rows={8}
+                  className="w-full rounded-lg border border-border-default px-3 py-2 text-sm bg-surface-primary focus:outline-none focus:ring-2 focus:ring-desert-green focus:border-transparent font-mono"
+                  placeholder="Enter a custom system prompt…"
+                />
+                <div className="mt-2 text-xs text-text-muted">
+                  Tip: Keep this stable. Use the chat messages for per-conversation context.
+                </div>
+              </div>
+              <div className="flex flex-col gap-2 w-[180px] flex-shrink-0">
+                <button
+                  type="button"
+                  disabled={!promptDirty || savePromptMutation.isPending}
+                  onClick={() => savePromptMutation.mutate(promptDraft)}
+                  className={classNames(
+                    'px-3 py-2 rounded-lg text-sm font-medium transition-colors',
+                    !promptDirty || savePromptMutation.isPending
+                      ? 'bg-border-default text-text-muted cursor-not-allowed'
+                      : 'bg-desert-green text-white hover:bg-desert-green/90'
+                  )}
+                >
+                  {savePromptMutation.isPending ? 'Saving…' : 'Save'}
+                </button>
+                <button
+                  type="button"
+                  disabled={!defaultPromptData?.prompt}
+                  onClick={() => setPromptDraft(defaultPromptData?.prompt ?? '')}
+                  className={classNames(
+                    'px-3 py-2 rounded-lg text-sm border transition-colors',
+                    defaultPromptData?.prompt
+                      ? 'border-border-default text-text-secondary hover:bg-surface-secondary'
+                      : 'border-border-default text-text-muted cursor-not-allowed'
+                  )}
+                >
+                  Reset to Default
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPromptEditorOpen(false)}
+                  className="px-3 py-2 rounded-lg text-sm border border-border-default text-text-secondary hover:bg-surface-secondary transition-colors"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
         <ChatInterface
           messages={messages}
           onSendMessage={handleSendMessage}
+          onStopMessage={handleStopMessage}
           isLoading={isStreamingResponse || chatMutation.isPending}
           chatSuggestions={chatSuggestions}
           chatSuggestionsEnabled={suggestionsEnabled}

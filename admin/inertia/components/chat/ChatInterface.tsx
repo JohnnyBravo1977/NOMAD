@@ -1,4 +1,4 @@
-import { IconSend, IconWand } from '@tabler/icons-react'
+import { IconPlayerStopFilled, IconSend, IconWand } from '@tabler/icons-react'
 import { useState, useRef, useEffect } from 'react'
 import classNames from '~/lib/classNames'
 import { ChatMessage } from '../../../types/chat'
@@ -14,6 +14,7 @@ import { usePage } from '@inertiajs/react'
 interface ChatInterfaceProps {
   messages: ChatMessage[]
   onSendMessage: (message: string) => void
+  onStopMessage?: () => void
   isLoading?: boolean
   chatSuggestions?: string[]
   chatSuggestionsEnabled?: boolean
@@ -24,6 +25,7 @@ interface ChatInterfaceProps {
 export default function ChatInterface({
   messages,
   onSendMessage,
+  onStopMessage,
   isLoading = false,
   chatSuggestions = [],
   chatSuggestionsEnabled = false,
@@ -37,6 +39,7 @@ export default function ChatInterface({
   const [isDownloading, setIsDownloading] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const shouldRestoreFocusRef = useRef(false)
 
   const handleDownloadModel = async () => {
     setIsDownloading(true)
@@ -59,9 +62,20 @@ export default function ChatInterface({
     scrollToBottom()
   }, [messages])
 
+  useEffect(() => {
+    if (isLoading) return
+    if (!shouldRestoreFocusRef.current) return
+
+    shouldRestoreFocusRef.current = false
+    requestAnimationFrame(() => {
+      textareaRef.current?.focus()
+    })
+  }, [isLoading])
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     if (input.trim() && !isLoading) {
+      shouldRestoreFocusRef.current = true
       onSendMessage(input.trim())
       setInput('')
       if (textareaRef.current) {
@@ -170,17 +184,25 @@ export default function ChatInterface({
             />
           </div>
           <button
-            type="submit"
-            disabled={!input.trim() || isLoading}
+            type={isLoading ? 'button' : 'submit'}
+            onClick={isLoading ? onStopMessage : undefined}
+            disabled={isLoading ? !onStopMessage : !input.trim()}
             className={classNames(
-              'p-3 rounded-lg transition-all duration-200 flex-shrink-0 mb-2',
-              !input.trim() || isLoading
-                ? 'bg-border-default text-text-muted cursor-not-allowed'
-                : 'bg-desert-green text-white hover:bg-desert-green/90 hover:scale-105'
+              'rounded-lg transition-all duration-200 flex-shrink-0 mb-2 inline-flex items-center justify-center gap-2',
+              isLoading
+                ? 'px-3 py-3 bg-red-600 text-white hover:bg-red-700 hover:scale-105 shadow-sm'
+                : !input.trim()
+                  ? 'p-3 bg-border-default text-text-muted cursor-not-allowed'
+                  : 'p-3 bg-desert-green text-white hover:bg-desert-green/90 hover:scale-105'
             )}
+            aria-label={isLoading ? `Stop ${aiAssistantName}` : `Send message to ${aiAssistantName}`}
+            title={isLoading ? `Stop ${aiAssistantName}` : 'Send'}
           >
             {isLoading ? (
-              <div className="h-6 w-6 border-2 border-white border-t-transparent rounded-full animate-spin" />
+              <>
+                <IconPlayerStopFilled className="h-5 w-5" />
+                <span className="text-sm font-medium">Stop</span>
+              </>
             ) : (
               <IconSend className="h-6 w-6" />
             )}

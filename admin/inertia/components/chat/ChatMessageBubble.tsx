@@ -7,7 +7,19 @@ export interface ChatMessageBubbleProps {
   message: ChatMessage
 }
 
+function stripReasoningBlocks(text: string): string {
+  let out = text
+  // Remove fenced code blocks that start with Reasoning/Thinking Process
+  out = out.replace(/```[\s\S]*?\b(Reasoning|Thinking Process)[\s\S]*?```/gi, '').trimStart()
+  // Remove leading Reasoning/Thinking Process paragraphs
+  out = out.replace(/^(Reasoning|Thinking Process)\s*[:\-]*[\s\S]*?\n\s*\n/i, '').trimStart()
+  return out
+}
+
 export default function ChatMessageBubble({ message }: ChatMessageBubbleProps) {
+  const assistantContent = message.role === 'assistant'
+    ? stripReasoningBlocks(message.content || '')
+    : message.content
   return (
     <div
       className={classNames(
@@ -93,10 +105,10 @@ export default function ChatMessageBubble({ message }: ChatMessageBubbleProps) {
               ),
             }}
           >
-            {message.content}
+            {assistantContent}
           </ReactMarkdown>
         ) : (
-          message.content
+          assistantContent
         )}
         {message.isStreaming && (
           <span className="inline-block w-2 h-4 ml-1 bg-current animate-pulse" />

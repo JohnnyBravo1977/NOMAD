@@ -114,6 +114,7 @@ router
     router.post('/models', [OllamaController, 'dispatchModelDownload'])
     router.delete('/models', [OllamaController, 'deleteModel'])
     router.get('/installed-models', [OllamaController, 'installedModels'])
+    router.get('/system-prompt-default', [OllamaController, 'systemPromptDefault'])
     router.post('/configure-remote', [OllamaController, 'configureRemote'])
     router.get('/remote-status', [OllamaController, 'remoteStatus'])
   })

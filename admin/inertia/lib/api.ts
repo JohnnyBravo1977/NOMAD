@@ -777,6 +777,15 @@ class API {
     })()
   }
 
+  async getDefaultSystemPrompt() {
+    return catchInternal(async () => {
+      const response = await this.client.get<{ prompt: string }>(
+        '/ollama/system-prompt-default'
+      )
+      return response.data
+    })()
+  }
+
   async updateSetting(key: string, value: any) {
     return catchInternal(async () => {
       const response = await this.client.patch<{ success: boolean; message: string }>(
