@@ -1,0 +1,370 @@
+import { inject } from '@adonisjs/core'
+import { DockerService } from '#services/docker_service'
+import { readFile, readdir, stat } from 'fs/promises'
+import path from 'node:path'
+
+type ReadTask =
+  | { kind: 'inspect_container'; containerName: string }
+  | { kind: 'tail_container_logs'; containerName: string }
+  | { kind: 'read_file'; filePath: string }
+  | { kind: 'list_directory'; dirPath: string }
+  | { kind: 'find_files'; query: string }
+  | { kind: 'search_text'; pattern: string; targetPath?: string }
+  | { kind: 'check_disk_usage'; targetPath?: string }
+
+const ALLOWED_READ_ROOTS = ['/app', '/tmp']
+const MAX_FILE_BYTES = 64 * 1024
+const MAX_SEARCH_RESULTS = 12
+const MAX_WALK_RESULTS = 24
+
+@inject()
+export class ReadWorkerService {
+  constructor(private dockerService: DockerService) {}
+
+  async tryHandle(userText: string): Promise<string | null> {
+    const task = this.parseTask(userText)
+    if (!task) return null
+
+    switch (task.kind) {
+      case 'inspect_container':
+        return this.inspectContainer(task.containerName)
+      case 'tail_container_logs':
+        return this.tailContainerLogs(task.containerName)
+      case 'read_file':
+        return this.readTextFile(task.filePath)
+      case 'list_directory':
+        return this.listDirectory(task.dirPath)
+      case 'find_files':
+        return this.findFiles(task.query)
+      case 'search_text':
+        return this.searchText(task.pattern, task.targetPath)
+      case 'check_disk_usage':
+        return this.checkDiskUsage(task.targetPath)
+      default:
+        return null
+    }
+  }
+
+  private parseTask(userText: string): ReadTask | null {
+    const text = userText.trim()
+
+    let match =
+      text.match(/\b(?:inspect|check|look at|show)\s+(?:the\s+)?container\s+([a-zA-Z0-9._-]+)/i) ||
+      text.match(/\b(?:inspect|check|look at|show)\s+([a-zA-Z0-9._-]+)\s+container\b/i)
+    if (match) {
+      return { kind: 'inspect_container', containerName: match[1] }
+    }
+
+    match =
+      text.match(/\b(?:show|tail|read|inspect|check)\s+(?:the\s+)?logs(?:\s+for|\s+of)?\s+([a-zA-Z0-9._-]+)/i) ||
+      text.match(/\b([a-zA-Z0-9._-]+)\s+logs\b/i)
+    if (match) {
+      return { kind: 'tail_container_logs', containerName: match[1] }
+    }
+
+    match =
+      text.match(/\b(?:read|show|open|inspect)\s+(?:the\s+)?file\s+(.+)$/i) ||
+      text.match(/\b(?:read|show|open|inspect)\s+((?:\/app|\/tmp)[^\s]*)$/i)
+    if (match) {
+      return { kind: 'read_file', filePath: stripWrappingQuotes(match[1]) }
+    }
+
+    match =
+      text.match(/\b(?:list|show)\s+(?:the\s+)?(?:directory|folder)\s+(.+)$/i) ||
+      text.match(/\b(?:list|show)\s+files in\s+(.+)$/i)
+    if (match) {
+      return { kind: 'list_directory', dirPath: stripWrappingQuotes(match[1]) }
+    }
+
+    const searchMatch =
+      text.match(/\b(?:search|look)\s+(?:for\s+)?["']([^"']+)["'](?:\s+in\s+(.+))?$/i) ||
+      text.match(/\bgrep\s+["']([^"']+)["'](?:\s+in\s+(.+))?$/i)
+    if (searchMatch) {
+      return {
+        kind: 'search_text',
+        pattern: searchMatch[1],
+        targetPath: searchMatch[2] ? stripWrappingQuotes(searchMatch[2]) : undefined,
+      }
+    }
+
+    match =
+      text.match(/\b(?:find|locate)\s+(?:the\s+)?(?:file\s+)?(.+)$/i) ||
+      text.match(/\bwhere is\s+(.+)$/i)
+    if (match) {
+      return { kind: 'find_files', query: stripWrappingQuotes(match[1]) }
+    }
+
+    if (/\b(?:disk usage|storage usage|space left|free space|df -h)\b/i.test(text)) {
+      const pathMatch = text.match(/\b(?:for|on|in)\s+((?:\/app|\/tmp)[^\s]*)/i)
+      return {
+        kind: 'check_disk_usage',
+        targetPath: pathMatch ? stripWrappingQuotes(pathMatch[1]) : undefined,
+      }
+    }
+
+    return null
+  }
+
+  private async inspectContainer(containerName: string): Promise<string> {
+    const container = await this.resolveContainer(containerName)
+    if (!container) {
+      return `I couldn't find a container named ${containerName}.`
+    }
+
+    const info = await this.dockerService.docker.getContainer(container.Id).inspect()
+    const image = info.Config?.Image || 'unknown'
+    const state = info.State?.Status || 'unknown'
+    const ports = Object.entries(info.NetworkSettings?.Ports || {})
+      .flatMap(([containerPort, bindings]) =>
+        Array.isArray(bindings) && bindings.length > 0
+          ? bindings.map((binding) => `${binding.HostPort}->${containerPort}`)
+          : [containerPort]
+      )
+      .slice(0, 8)
+    const mounts = (info.Mounts || [])
+      .map((mount) => `${mount.Source} -> ${mount.Destination}`)
+      .slice(0, 6)
+
+    const lines = [
+      `Container ${containerName}:`,
+      `Status: ${state}`,
+      `Image: ${image}`,
+    ]
+    if (ports.length > 0) lines.push(`Ports: ${ports.join(', ')}`)
+    if (mounts.length > 0) lines.push(`Mounts: ${mounts.join('; ')}`)
+
+    return lines.join('\n')
+  }
+
+  private async tailContainerLogs(containerName: string): Promise<string> {
+    const container = await this.resolveContainer(containerName)
+    if (!container) {
+      return `I couldn't find a container named ${containerName}.`
+    }
+
+    const logBuffer = await this.dockerService.docker
+      .getContainer(container.Id)
+      .logs({ stdout: true, stderr: true, tail: 40 })
+    const rawText = Buffer.isBuffer(logBuffer)
+      ? demuxDockerLogBuffer(logBuffer)
+      : String(logBuffer)
+    const cleaned = stripDockerLogFrames(rawText)
+      .split('\n')
+      .map((line) => line.trimEnd())
+      .filter(Boolean)
+      .slice(-20)
+
+    if (cleaned.length === 0) {
+      return `I checked ${containerName}, but there weren't any recent logs to show.`
+    }
+
+    return `Recent logs for ${containerName}:\n${cleaned.join('\n')}`
+  }
+
+  private async readTextFile(filePath: string): Promise<string> {
+    const resolvedPath = this.resolveAllowedPath(filePath)
+    const fileInfo = await stat(resolvedPath)
+    if (!fileInfo.isFile()) {
+      return `${filePath} is not a file.`
+    }
+
+    const content = await readFile(resolvedPath, 'utf-8')
+    const trimmed = content.length > MAX_FILE_BYTES ? `${content.slice(0, MAX_FILE_BYTES)}\n...[truncated]` : content
+    return `Contents of ${resolvedPath}:\n${trimmed}`
+  }
+
+  private async listDirectory(dirPath: string): Promise<string> {
+    const resolvedPath = this.resolveAllowedPath(dirPath)
+    const dirInfo = await stat(resolvedPath)
+    if (!dirInfo.isDirectory()) {
+      return `${dirPath} is not a directory.`
+    }
+
+    const entries = await readdir(resolvedPath, { withFileTypes: true })
+    const names = entries
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .slice(0, 50)
+      .map((entry) => `${entry.isDirectory() ? '[dir]' : '[file]'} ${entry.name}`)
+
+    return names.length > 0
+      ? `Contents of ${resolvedPath}:\n${names.join('\n')}`
+      : `${resolvedPath} is empty.`
+  }
+
+  private async findFiles(query: string): Promise<string> {
+    const normalizedQuery = query.trim().toLowerCase()
+    const results: string[] = []
+
+    for (const root of ALLOWED_READ_ROOTS) {
+      await this.walkFiles(root, async (fullPath) => {
+        if (results.length >= MAX_WALK_RESULTS) return false
+        if (path.basename(fullPath).toLowerCase().includes(normalizedQuery)) {
+          results.push(fullPath)
+        }
+        return true
+      })
+      if (results.length >= MAX_WALK_RESULTS) break
+    }
+
+    if (results.length === 0) {
+      return `I couldn't find any files matching ${query}.`
+    }
+
+    return `I found these matching files:\n${results.join('\n')}`
+  }
+
+  private async searchText(pattern: string, targetPath?: string): Promise<string> {
+    const roots = targetPath ? [this.resolveAllowedPath(targetPath)] : ALLOWED_READ_ROOTS
+    const normalizedPattern = pattern.toLowerCase()
+    const matches: string[] = []
+
+    for (const root of roots) {
+      await this.walkFiles(root, async (fullPath) => {
+        if (matches.length >= MAX_SEARCH_RESULTS) return false
+        const fileInfo = await stat(fullPath)
+        if (!fileInfo.isFile() || fileInfo.size > MAX_FILE_BYTES) return true
+
+        try {
+          const content = await readFile(fullPath, 'utf-8')
+          const lines = content.split('\n')
+          for (let index = 0; index < lines.length; index += 1) {
+            if (lines[index].toLowerCase().includes(normalizedPattern)) {
+              matches.push(`${fullPath}:${index + 1}: ${lines[index].trim()}`)
+              if (matches.length >= MAX_SEARCH_RESULTS) return false
+            }
+          }
+        } catch {
+          return true
+        }
+        return true
+      })
+      if (matches.length >= MAX_SEARCH_RESULTS) break
+    }
+
+    if (matches.length === 0) {
+      return `I couldn't find "${pattern}" in the allowed read paths.`
+    }
+
+    return `I found these matches for "${pattern}":\n${matches.join('\n')}`
+  }
+
+  private async checkDiskUsage(targetPath?: string): Promise<string> {
+    const roots = targetPath ? [this.resolveAllowedPath(targetPath)] : ALLOWED_READ_ROOTS
+    const lines: string[] = []
+
+    for (const root of roots) {
+      const fileInfo = await stat(root)
+      if (fileInfo.isDirectory()) {
+        const sizeBytes = await this.directorySize(root)
+        lines.push(`${root}: ${formatBytes(sizeBytes)}`)
+      } else {
+        lines.push(`${root}: ${formatBytes(fileInfo.size)}`)
+      }
+    }
+
+    return `Disk usage snapshot:\n${lines.join('\n')}`
+  }
+
+  private async resolveContainer(name: string) {
+    const normalized = name.replace(/^\//, '')
+    const containers = await this.dockerService.docker.listContainers({ all: true })
+    return containers.find((container) =>
+      container.Names.some((containerName) => containerName.replace(/^\//, '') === normalized)
+    ) || null
+  }
+
+  private resolveAllowedPath(requestedPath: string): string {
+    const trimmed = requestedPath.trim()
+    const resolved = path.resolve(trimmed)
+    const allowed = ALLOWED_READ_ROOTS.some((root) => resolved === root || resolved.startsWith(`${root}/`))
+    if (!allowed) {
+      throw new Error(`Path ${requestedPath} is outside the allowed read roots.`)
+    }
+    return resolved
+  }
+
+  private async walkFiles(
+    startPath: string,
+    visitor: (fullPath: string) => Promise<boolean>
+  ): Promise<void> {
+    const resolved = this.resolveAllowedPath(startPath)
+    const dirInfo = await stat(resolved)
+    if (!dirInfo.isDirectory()) {
+      await visitor(resolved)
+      return
+    }
+
+    const queue: string[] = [resolved]
+    while (queue.length > 0) {
+      const current = queue.shift()!
+      const entries = await readdir(current, { withFileTypes: true })
+      for (const entry of entries) {
+        const fullPath = path.join(current, entry.name)
+        if (entry.isDirectory()) {
+          queue.push(fullPath)
+          continue
+        }
+        const shouldContinue = await visitor(fullPath)
+        if (!shouldContinue) return
+      }
+    }
+  }
+
+  private async directorySize(dirPath: string): Promise<number> {
+    let total = 0
+    await this.walkFiles(dirPath, async (fullPath) => {
+      const fileInfo = await stat(fullPath)
+      if (fileInfo.isFile()) total += fileInfo.size
+      return true
+    })
+    return total
+  }
+}
+
+function stripWrappingQuotes(value: string): string {
+  return value.trim().replace(/^['"]|['"]$/g, '')
+}
+
+function stripDockerLogFrames(text: string): string {
+  return text.replace(/[\u0000-\u0008\u000B-\u001F]/g, '')
+}
+
+function demuxDockerLogBuffer(buffer: Buffer): string {
+  if (buffer.length < 8) {
+    return buffer.toString('utf-8')
+  }
+
+  let offset = 0
+  let output = ''
+
+  while (offset + 8 <= buffer.length) {
+    const frameSize = buffer.readUInt32BE(offset + 4)
+    const frameStart = offset + 8
+    const frameEnd = frameStart + frameSize
+
+    if (frameSize < 0 || frameEnd > buffer.length) {
+      return buffer.toString('utf-8')
+    }
+
+    output += buffer.subarray(frameStart, frameEnd).toString('utf-8')
+    offset = frameEnd
+  }
+
+  if (offset < buffer.length) {
+    output += buffer.subarray(offset).toString('utf-8')
+  }
+
+  return output
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let value = bytes / 1024
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+  return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unitIndex]}`
+}

@@ -5,6 +5,7 @@ import KVStore from '#models/kv_store'
 import { RagService } from '#services/rag_service'
 import { ChatService } from '#services/chat_service'
 import { OllamaService } from '#services/ollama_service'
+import { ReadWorkerService } from '#services/read_worker_service'
 import { appendFile, mkdir, writeFile } from 'fs/promises'
 import logger from '@adonisjs/core/services/logger'
 import { DEFAULT_QUERY_REWRITE_MODEL, RAG_CONTEXT_LIMITS, SYSTEM_PROMPTS } from '../../constants/ollama.js'
@@ -107,7 +108,8 @@ type ChatTurnResult =
 export class ChatOrchestratorService {
   constructor(
     private chatService: ChatService,
-    private ollamaService: OllamaService
+    private ollamaService: OllamaService,
+    private readWorkerService: ReadWorkerService
   ) {}
 
   getContextLimitsForModel(modelName: string): { maxResults: number; maxTokens: number } {
@@ -520,6 +522,23 @@ export class ChatOrchestratorService {
     ragService: RagService
   }): Promise<DirectAnswerPlan> {
     const { lastUserText, profiles, activeUser, userName, ragService } = args
+    try {
+      const readWorkerAnswer = await this.readWorkerService.tryHandle(lastUserText)
+      if (readWorkerAnswer) {
+        return { content: readWorkerAnswer }
+      }
+    } catch (error) {
+      logger.warn(
+        `[ChatOrchestratorService] Read worker failed: ${error instanceof Error ? error.message : error}`
+      )
+      return {
+        content:
+          error instanceof Error
+            ? error.message
+            : 'I hit a problem while trying to inspect that.'
+      }
+    }
+
     const memoryAnswer = buildMemoryAnswer(lastUserText, profiles, activeUser || userName || null)
     if (memoryAnswer) {
       return { content: memoryAnswer }
