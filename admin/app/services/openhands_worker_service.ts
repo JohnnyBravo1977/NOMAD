@@ -26,6 +26,10 @@ type OpenHandsConversationInfo = {
 
 type OpenHandsConversationEventsResponse = {
   events?: Array<{
+    id?: number
+    source?: string
+    message?: string
+    content?: string
     observation?: string
     extras?: {
       agent_state?: string
@@ -256,6 +260,7 @@ export class OpenHandsWorkerService {
     conversationStatus?: string
     agentState?: string
     reason?: string
+    latestUpdate?: string
     message?: string
   }> {
     const { available, url } = await this.checkAvailable()
@@ -301,6 +306,7 @@ export class OpenHandsWorkerService {
 
       let agentState: string | undefined
       let reason: string | undefined
+      let latestUpdate: string | undefined
       const eventsResponse = await this.curlJson([
         '--max-time',
         '20',
@@ -325,6 +331,28 @@ export class OpenHandsWorkerService {
               .find(
               (event) => event.observation === 'agent_state_changed' && event.extras?.reason
               )?.extras?.reason || undefined
+          latestUpdate =
+            [...events]
+              .reverse()
+              .find((event) => {
+                const text = (event.message || event.content || '').trim()
+                if (!text) return false
+                if (event.source !== 'agent') return false
+                if (text.startsWith('You are OpenHands agent')) return false
+                return true
+              })
+              ?.message?.trim() ||
+            [...events]
+              .reverse()
+              .find((event) => {
+                const text = (event.message || event.content || '').trim()
+                if (!text) return false
+                if (event.source !== 'agent') return false
+                if (text.startsWith('You are OpenHands agent')) return false
+                return true
+              })
+              ?.content?.trim() ||
+            undefined
         } catch {
           // Ignore event parse issues and fall back to coarse conversation status.
         }
@@ -337,6 +365,7 @@ export class OpenHandsWorkerService {
         conversationStatus: data.conversation_status || data.status,
         agentState,
         reason,
+        latestUpdate,
       }
     } catch (error) {
       return {
@@ -410,6 +439,9 @@ export class OpenHandsWorkerService {
         }
         if (status.reason) {
           lines.push(`Reason: ${status.reason}`)
+        }
+        if (status.latestUpdate) {
+          lines.push(`Latest update: ${status.latestUpdate}`)
         }
 
         return [
