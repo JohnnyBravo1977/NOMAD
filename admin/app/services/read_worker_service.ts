@@ -233,21 +233,38 @@ export class ReadWorkerService {
     const sortedEntries = entries
       .sort((a, b) => a.name.localeCompare(b.name))
       .slice(0, 50)
-    const directories = sortedEntries.filter((entry) => entry.isDirectory()).map((entry) => `${entry.name}/`)
+    const directories = sortedEntries.filter((entry) => entry.isDirectory()).map((entry) => entry.name)
     const files = sortedEntries.filter((entry) => !entry.isDirectory()).map((entry) => entry.name)
 
-    const lines = [`I checked ${resolvedPath}.`]
-    lines.push(`I found ${sortedEntries.length} top-level item${sortedEntries.length === 1 ? '' : 's'}.`)
-    if (directories.length > 0) {
-      lines.push(`Directories: ${directories.join(', ')}`)
-    }
-    if (files.length > 0) {
-      lines.push(`Files: ${files.join(', ')}`)
-    }
+    const lines = [this.describeDirectorySummary(resolvedPath, directories, files, sortedEntries.length)]
 
     return sortedEntries.length > 0
       ? lines.join('\n')
       : `${resolvedPath} is empty.`
+  }
+
+  private describeDirectorySummary(
+    resolvedPath: string,
+    directories: string[],
+    files: string[],
+    totalItems: number
+  ): string {
+    const folderPreview = formatList(directories.slice(0, 8))
+    const filePreview = formatList(files.slice(0, 8))
+    const locationLabel = resolvedPath === '/app' ? 'the app workspace' : resolvedPath
+
+    const parts = [`I checked ${locationLabel}.`]
+    parts.push(`I found ${totalItems} top-level item${totalItems === 1 ? '' : 's'}.`)
+
+    if (folderPreview) {
+      parts.push(`The main folders in there are ${folderPreview}.`)
+    }
+
+    if (filePreview) {
+      parts.push(`The key files I can see are ${filePreview}.`)
+    }
+
+    return parts.join(' ')
   }
 
   private async listHomeAssistantDirectories(): Promise<string> {
@@ -496,4 +513,11 @@ function formatBytes(bytes: number): string {
     unitIndex += 1
   }
   return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unitIndex]}`
+}
+
+function formatList(items: string[]): string {
+  if (items.length === 0) return ''
+  if (items.length === 1) return items[0]
+  if (items.length === 2) return `${items[0]} and ${items[1]}`
+  return `${items.slice(0, -1).join(', ')}, and ${items[items.length - 1]}`
 }
