@@ -8,6 +8,8 @@ const DEFAULT_INTERNAL_URL = 'http://nomad_openhands:3000'
 const DEFAULT_EXTERNAL_URL = 'http://127.0.0.1:3001'
 const DEFAULT_HOST_URL = 'http://host.docker.internal:3001'
 const OPENHANDS_SESSIONS_DIR = '/openhands-data/sessions'
+const OPENHANDS_PREWARM_GOAL =
+  'Prewarm the isolated workspace runtime. Run pwd && ls once inside /workspace, do not modify files, then wait for further instruction.'
 const execFileAsync = promisify(execFile)
 
 type OpenHandsConversationResponse = {
@@ -40,6 +42,25 @@ type OpenHandsConversationEventsResponse = {
 
 @inject()
 export class OpenHandsWorkerService {
+  private isWarmConversationActive(status: {
+    ok: boolean
+    conversationStatus?: string
+    agentState?: string
+  }): boolean {
+    if (!status.ok) return false
+
+    const conversationStatus = (status.conversationStatus || '').toLowerCase()
+    const agentState = (status.agentState || '').toLowerCase()
+
+    return (
+      conversationStatus === 'starting' ||
+      conversationStatus === 'running' ||
+      agentState === 'loading' ||
+      agentState === 'running' ||
+      agentState === 'awaiting_user_input'
+    )
+  }
+
   private summarizeLatestUpdate(update?: string): string | null {
     const text = update?.trim()
     if (!text) return null
@@ -131,6 +152,16 @@ export class OpenHandsWorkerService {
       'Do not attempt to write to the real host Desktop or the real host ~/.local/share/applications.',
       'If asked to create a host Ubuntu shortcut, explain that the missing capability is safe host-desktop access and stop there.',
       'Do not claim completion for a host-desktop launcher task.',
+    ].join('\n')
+  }
+
+  private buildPrewarmConversationInstructions(): string {
+    return [
+      'This is a runtime prewarm task for future delegated work.',
+      'Use the isolated OpenHands workspace mounted at /workspace.',
+      'Run one lightweight inspection command in /workspace to force the runtime and tools to initialize.',
+      'Do not modify files, do not ask the user a question unless something is actually broken, and stop after the initial inspection.',
+      'After the inspection, wait for further instruction so the sandbox can remain warm for later tasks.',
     ].join('\n')
   }
 
@@ -239,35 +270,30 @@ export class OpenHandsWorkerService {
     return { available: false, url: candidateUrls[0] }
   }
 
-  async startTask(goal: string): Promise<{
+  private async createConversationWithFallback(
+    goal: string,
+    conversationInstructions: string | undefined,
+    options?: {
+      requestTimeoutSeconds?: number
+      sessionWaitTimeoutMs?: number
+    }
+  ): Promise<{
     ok: boolean
     url: string
     conversationId?: string
     conversationStatus?: string
     message?: string
   }> {
-    const normalizedGoal = this.normalizeGoal(goal)
-    if (this.isDesktopShortcutGoal(normalizedGoal)) {
-      return {
-        ok: false,
-        url: await this.getInternalUrl(),
-        message: [
-          'Missing capability: verified host Ubuntu desktop shortcut creation is intentionally disabled right now.',
-          'Current status:',
-          '- OpenHands is isolated from the real host home directory for safety.',
-          '- To do this again safely, we would need a narrower approved host-action bridge instead of direct home-directory access.',
-        ].join('\n'),
-      }
-    }
-    const conversationInstructions = this.buildConversationInstructions(normalizedGoal)
     const knownSessionIds = await this.listSessionIds()
     const candidateUrls = [await this.getInternalUrl(), DEFAULT_HOST_URL]
+    const requestTimeoutSeconds = options?.requestTimeoutSeconds ?? 8
+    const sessionWaitTimeoutMs = options?.sessionWaitTimeoutMs ?? 12000
     let lastError = ''
 
     for (const url of candidateUrls) {
       const response = await this.curlJson([
         '--max-time',
-        '8',
+        String(requestTimeoutSeconds),
         '-sS',
         '-X',
         'POST',
@@ -280,7 +306,7 @@ export class OpenHandsWorkerService {
         `${url}/api/conversations`,
         '--data',
         JSON.stringify({
-          initial_user_msg: normalizedGoal,
+          initial_user_msg: goal,
           conversation_instructions: conversationInstructions,
         }),
       ])
@@ -307,7 +333,7 @@ export class OpenHandsWorkerService {
         }
       }
 
-      const fallbackConversationId = await this.waitForNewSessionId(knownSessionIds, 12000)
+      const fallbackConversationId = await this.waitForNewSessionId(knownSessionIds, sessionWaitTimeoutMs)
       if (fallbackConversationId) {
         const fallbackStatus = await this.getConversationStatus(fallbackConversationId)
         return {
@@ -324,6 +350,87 @@ export class OpenHandsWorkerService {
       ok: false,
       url: candidateUrls[0],
       message: lastError || `OpenHands is not reachable at ${candidateUrls[0]}.`,
+    }
+  }
+
+  async startTask(goal: string): Promise<{
+    ok: boolean
+    url: string
+    conversationId?: string
+    conversationStatus?: string
+    message?: string
+  }> {
+    const normalizedGoal = this.normalizeGoal(goal)
+    if (this.isDesktopShortcutGoal(normalizedGoal)) {
+      return {
+        ok: false,
+        url: await this.getInternalUrl(),
+        message: [
+          'Missing capability: verified host Ubuntu desktop shortcut creation is intentionally disabled right now.',
+          'Current status:',
+          '- OpenHands is isolated from the real host home directory for safety.',
+          '- To do this again safely, we would need a narrower approved host-action bridge instead of direct home-directory access.',
+        ].join('\n'),
+      }
+    }
+    const conversationInstructions =
+      normalizedGoal === OPENHANDS_PREWARM_GOAL
+        ? this.buildPrewarmConversationInstructions()
+        : this.buildConversationInstructions(normalizedGoal)
+    return this.createConversationWithFallback(normalizedGoal, conversationInstructions)
+  }
+
+  async ensureWarmRuntime(force: boolean = false): Promise<{
+    ok: boolean
+    url: string
+    conversationId?: string
+    conversationStatus?: string
+    message?: string
+    created?: boolean
+  }> {
+    const url = await this.getInternalUrl()
+    const warmConversationId = await KVStore.getValue('ai.openhandsWarmConversationId')
+
+    if (warmConversationId && !force) {
+      const existingStatus = await this.getConversationStatus(warmConversationId)
+      if (this.isWarmConversationActive(existingStatus)) {
+        return {
+          ok: true,
+          url: existingStatus.url,
+          conversationId: existingStatus.conversationId,
+          conversationStatus:
+            existingStatus.agentState || existingStatus.conversationStatus || 'running',
+          created: false,
+        }
+      }
+    }
+
+    const warmTask = await this.createConversationWithFallback(
+      OPENHANDS_PREWARM_GOAL,
+      this.buildPrewarmConversationInstructions(),
+      {
+        requestTimeoutSeconds: 20,
+        sessionWaitTimeoutMs: 45000,
+      }
+    )
+    if (!warmTask.ok) {
+      return {
+        ok: false,
+        url: warmTask.url || url,
+        message: warmTask.message || 'OpenHands prewarm could not be started.',
+      }
+    }
+
+    if (warmTask.conversationId) {
+      await KVStore.setValue('ai.openhandsWarmConversationId', warmTask.conversationId)
+    }
+
+    return {
+      ok: true,
+      url: warmTask.url,
+      conversationId: warmTask.conversationId,
+      conversationStatus: warmTask.conversationStatus,
+      created: true,
     }
   }
 
@@ -474,6 +581,10 @@ export class OpenHandsWorkerService {
   async describeCapabilities(): Promise<string> {
     const { available, url } = await this.checkAvailable()
     const status = available ? 'available' : 'unavailable'
+    const warmConversationId = await KVStore.getValue('ai.openhandsWarmConversationId')
+    const warmStatus = warmConversationId
+      ? await this.getConversationStatus(warmConversationId)
+      : null
 
     return [
       'OpenHands worker capabilities:',
@@ -484,6 +595,11 @@ export class OpenHandsWorkerService {
       `- Status: ${status}`,
       `- Internal URL: ${url}`,
       `- External UI: ${DEFAULT_EXTERNAL_URL}`,
+      `- Warm runtime: ${
+        warmStatus && this.isWarmConversationActive(warmStatus)
+          ? `ready (${warmStatus.conversationId})`
+          : 'not ready'
+      }`,
       'Current limits:',
       '- Quinn only hands off tasks to OpenHands when explicitly asked to use OpenHands',
       '- Quinn can check the latest delegated OpenHands conversation status, but does not yet stream its intermediate events back into chat',
