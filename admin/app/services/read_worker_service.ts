@@ -175,7 +175,7 @@ export class ReadWorkerService {
       .slice(0, 6)
 
     const lines = [
-      `Container ${containerName}:`,
+      `I checked the ${containerName} container.`,
       `Status: ${state}`,
       `Image: ${image}`,
     ]
@@ -207,7 +207,7 @@ export class ReadWorkerService {
       return `I checked ${containerName}, but there weren't any recent logs to show.`
     }
 
-    return `Recent logs for ${containerName}:\n${cleaned.join('\n')}`
+    return `I pulled the latest logs from ${containerName}:\n${cleaned.join('\n')}`
   }
 
   private async readTextFile(filePath: string): Promise<string> {
@@ -219,7 +219,7 @@ export class ReadWorkerService {
 
     const content = await readFile(resolvedPath, 'utf-8')
     const trimmed = content.length > MAX_FILE_BYTES ? `${content.slice(0, MAX_FILE_BYTES)}\n...[truncated]` : content
-    return `Contents of ${resolvedPath}:\n${trimmed}`
+    return `I opened ${resolvedPath}. Here is the file:\n${trimmed}`
   }
 
   private async listDirectory(dirPath: string): Promise<string> {
@@ -236,7 +236,7 @@ export class ReadWorkerService {
       .map((entry) => `${entry.isDirectory() ? '[dir]' : '[file]'} ${entry.name}`)
 
     return names.length > 0
-      ? `Contents of ${resolvedPath}:\n${names.join('\n')}`
+      ? `I checked ${resolvedPath}. Here is what is there:\n${names.join('\n')}`
       : `${resolvedPath} is empty.`
   }
 

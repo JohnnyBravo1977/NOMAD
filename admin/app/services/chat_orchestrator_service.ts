@@ -720,9 +720,6 @@ export class ChatOrchestratorService {
     const directResponseText =
       source === 'capabilities' ||
       source === 'read' ||
-      source === 'edit' ||
-      source === 'system' ||
-      source === 'home_assistant' ||
       source === 'terminal' ||
       source === 'missing_capability' ||
       source === 'openhands' ||
@@ -740,6 +737,14 @@ export class ChatOrchestratorService {
           ? 'Do not imply the delegated task is completed unless the grounded result explicitly says it is completed. If the grounded result only says the task was accepted or started, say only that.'
         : source === 'terminal'
           ? 'Include the verified command, exit code, and any stdout or stderr present in the grounded result. Do not omit the command result.'
+        : source === 'read'
+          ? 'Answer naturally, but stay faithful to the grounded result. If the grounded result contains file contents, directory listings, container details, or log lines, keep those concrete details in the reply. Do not invent or omit important paths, names, statuses, or lines.'
+        : source === 'system'
+          ? 'Answer naturally in plain language, but keep every concrete value from the grounded result.'
+        : source === 'home_assistant'
+          ? 'Answer naturally in plain language, but keep every grounded entity, action, and state exactly consistent with the grounded result.'
+        : source === 'edit'
+          ? 'Answer naturally and briefly describe exactly what changed, using only the grounded result.'
         : 'Answer the request from the grounded result only.'
 
     return {
