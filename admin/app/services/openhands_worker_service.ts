@@ -40,6 +40,80 @@ type OpenHandsConversationEventsResponse = {
 
 @inject()
 export class OpenHandsWorkerService {
+  private summarizeLatestUpdate(update?: string): string | null {
+    const text = update?.trim()
+    if (!text) return null
+
+    if (/^Running command:/i.test(text)) {
+      return text.replace(/^Running command:\s*/i, 'Latest action: ')
+    }
+
+    return text
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+
+  private formatAcceptedTaskMessage(goal: string, conversationId?: string, conversationStatus?: string): string {
+    const lines = [
+      `I handed that to OpenHands: ${goal}.`,
+    ]
+
+    if ((conversationStatus || '').toLowerCase() === 'starting') {
+      lines.push('It is starting up now, so the first useful result may take a moment.')
+    }
+
+    if (conversationId) {
+      lines.push(`Conversation ID: ${conversationId}`)
+    }
+
+    lines.push(`OpenHands UI: ${DEFAULT_EXTERNAL_URL}`)
+    lines.push('Ask me to check OpenHands task status if you want the latest progress.')
+    return lines.join('\n')
+  }
+
+  private formatConversationStatusMessage(status: {
+    conversationId?: string
+    conversationStatus?: string
+    agentState?: string
+    reason?: string
+    latestUpdate?: string
+  }): string {
+    const state = (status.agentState || '').toLowerCase()
+    const conversationStatus = status.conversationStatus || 'unknown'
+    const latestUpdate = this.summarizeLatestUpdate(status.latestUpdate)
+
+    const lines: string[] = []
+
+    if (state === 'loading' || conversationStatus.toLowerCase() === 'starting') {
+      lines.push('OpenHands is still starting up.')
+    } else if (state === 'awaiting_user_input') {
+      lines.push('OpenHands finished its latest step and is waiting for the next instruction.')
+    } else if (state === 'running') {
+      lines.push('OpenHands is working on the task now.')
+    } else if (state === 'finished') {
+      lines.push('OpenHands finished the task.')
+    } else if (state === 'stopped') {
+      lines.push('OpenHands stopped.')
+    } else {
+      lines.push(`OpenHands conversation status: ${conversationStatus}`)
+    }
+
+    if (latestUpdate) {
+      lines.push(latestUpdate)
+    }
+
+    if (status.reason) {
+      lines.push(`Reason: ${status.reason}`)
+    }
+
+    if (status.conversationId) {
+      lines.push(`Conversation ID: ${status.conversationId}`)
+    }
+
+    lines.push(`OpenHands UI: ${DEFAULT_EXTERNAL_URL}`)
+    return lines.join('\n')
+  }
+
   private isDesktopShortcutGoal(goal: string): boolean {
     const cleaned = goal.trim().toLowerCase()
     if (!cleaned) return false
@@ -390,13 +464,11 @@ export class OpenHandsWorkerService {
       await KVStore.setValue('ai.openhandsLastConversationId', task.conversationId)
     }
 
-    return [
-      `OpenHands accepted the task: ${normalizedGoal}`,
-      `Conversation ID: ${task.conversationId}`,
-      `Conversation status: ${task.conversationStatus || 'starting'}`,
-      `Internal URL: ${task.url}`,
-      `External UI: ${DEFAULT_EXTERNAL_URL}`,
-    ].join('\n')
+    return this.formatAcceptedTaskMessage(
+      normalizedGoal,
+      task.conversationId,
+      task.conversationStatus
+    )
   }
 
   async describeCapabilities(): Promise<string> {
@@ -431,25 +503,7 @@ export class OpenHandsWorkerService {
           return status.message || 'OpenHands conversation status is unavailable right now.'
         }
 
-        const lines = [
-          `OpenHands conversation status: ${status.conversationStatus || 'unknown'}`,
-        ]
-        if (status.agentState) {
-          lines.push(`Agent state: ${status.agentState.toUpperCase()}`)
-        }
-        if (status.reason) {
-          lines.push(`Reason: ${status.reason}`)
-        }
-        if (status.latestUpdate) {
-          lines.push(`Latest update: ${status.latestUpdate}`)
-        }
-
-        return [
-          ...lines,
-          `Conversation ID: ${status.conversationId}`,
-          `Internal URL: ${status.url}`,
-          `External UI: ${DEFAULT_EXTERNAL_URL}`,
-        ].join('\n')
+        return this.formatConversationStatusMessage(status)
       }
 
       const { available, url } = await this.checkAvailable()
