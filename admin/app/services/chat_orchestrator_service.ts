@@ -7,8 +7,10 @@ import { ChatService } from '#services/chat_service'
 import { OllamaService } from '#services/ollama_service'
 import { EditWorkerService } from '#services/edit_worker_service'
 import { HomeAssistantWorkerService } from '#services/home_assistant_worker_service'
+import { OpenHandsWorkerService } from '#services/openhands_worker_service'
 import { ReadWorkerService } from '#services/read_worker_service'
 import { SystemWorkerService } from '#services/system_worker_service'
+import { TerminalWorkerService } from '#services/terminal_worker_service'
 import { appendFile, mkdir, writeFile } from 'fs/promises'
 import logger from '@adonisjs/core/services/logger'
 import { DEFAULT_QUERY_REWRITE_MODEL, RAG_CONTEXT_LIMITS, SYSTEM_PROMPTS } from '../../constants/ollama.js'
@@ -41,8 +43,35 @@ type PersonalizationPlan = {
 }
 
 type DirectAnswerPlan = {
-  content: string
+  responseText?: string
+  contextMessage: Message
+  promptMessage: Message
 } | null
+
+type AutonomousTaskPlan =
+  | { source: 'task_loop'; result: string }
+  | { source: 'missing_capability'; result: string }
+  | null
+
+type AutonomousTaskDecision =
+  | { action: 'run'; worker: string; request: string }
+  | { action: 'done'; reason?: string }
+  | { action: 'cannot'; reason: string }
+
+type AutonomousTaskStep = {
+  step: number
+  worker: string
+  request: string
+  result: string
+}
+
+const ALLOWED_AUTONOMOUS_WORKERS = new Set([
+  'read',
+  'system',
+  'terminal',
+  'edit',
+  'home_assistant',
+])
 
 type StreamChunk = {
   message?: {
@@ -82,6 +111,7 @@ type ChatRequestInput = {
 type PreparedChatTurn = {
   messages: Message[]
   sessionId: number | null
+  originalUserContent: string | null
   ollamaRequest: {
     model: string
     messages: Message[]
@@ -113,6 +143,8 @@ export class ChatOrchestratorService {
     private chatService: ChatService,
     private ollamaService: OllamaService,
     private homeAssistantWorkerService: HomeAssistantWorkerService,
+    private openHandsWorkerService: OpenHandsWorkerService,
+    private terminalWorkerService: TerminalWorkerService,
     private editWorkerService: EditWorkerService,
     private readWorkerService: ReadWorkerService,
     private systemWorkerService: SystemWorkerService
@@ -194,6 +226,8 @@ export class ChatOrchestratorService {
   }): Promise<PreparedChatTurn> {
     const { requestData, ragService } = args
     const messages = requestData.messages.map((message) => ({ ...message }))
+    const originalLastUserMessage = [...messages].reverse().find((m) => m.role === 'user')
+    const originalUserContent = originalLastUserMessage?.content || null
 
     const customName = await KVStore.getValue('ai.assistantCustomName')
     const assistantName = customName && customName.trim() ? customName : 'AI Assistant'
@@ -216,6 +250,7 @@ export class ChatOrchestratorService {
 
     const directAnswer = await this.prepareDirectAnswer({
       lastUserText,
+      model: requestData.model,
       messages,
       profiles: personalizationPlan.profiles,
       activeUser: personalizationPlan.activeUser,
@@ -264,6 +299,7 @@ export class ChatOrchestratorService {
     return {
       messages,
       sessionId: sessionId ?? null,
+      originalUserContent,
       ollamaRequest: {
         ...restRequest,
         messages,
@@ -295,6 +331,7 @@ export class ChatOrchestratorService {
     const {
       messages,
       sessionId,
+      originalUserContent,
       ollamaRequest,
       lastUserText,
       rewriteMs,
@@ -307,23 +344,13 @@ export class ChatOrchestratorService {
       directAnswer,
     } = preparedTurn
 
-    if (directAnswer) {
-      const userContent = await this.saveUserMessage(sessionId, messages)
-      await this.saveAssistantReply({
-        sessionId,
-        userContent,
-        assistantContent: directAnswer.content,
-      })
-
-      if (requestData.stream) {
-        await onStreamChunk?.({ message: { content: directAnswer.content }, done: true })
-        return { kind: 'stream' }
-      }
-
-      return {
-        kind: 'json',
-        body: { message: { content: directAnswer.content }, done: true, model: requestData.model },
-      }
+    const useDirectResponse = !!directAnswer?.responseText
+    if (directAnswer && !useDirectResponse) {
+      const firstNonSystemIndex = messages.findIndex((msg) => msg.role !== 'system')
+      const insertIndex = firstNonSystemIndex === -1 ? 0 : firstNonSystemIndex
+      messages.splice(insertIndex, 0, directAnswer.contextMessage)
+      messages.push(directAnswer.promptMessage)
+      ollamaRequest.messages = messages
     }
 
     await this.logPromptIfEnabled({
@@ -335,7 +362,79 @@ export class ChatOrchestratorService {
       messages,
     })
 
-    const userContent = await this.saveUserMessage(sessionId, messages)
+    const userContent = await this.saveUserMessage(sessionId, originalUserContent)
+
+    if (directAnswer?.responseText) {
+      const assistantContent = directAnswer.responseText
+      if (requestData.stream) {
+        await onStreamChunk?.({
+          message: { content: assistantContent },
+        })
+        await onStreamChunk?.({
+          message: { content: '' },
+          done: true,
+        } as any)
+        await this.saveAssistantReply({
+          sessionId,
+          userContent,
+          assistantContent,
+        })
+        const perfPayload = {
+          timestamp: new Date().toISOString(),
+          model: requestData.model,
+          sessionId,
+          stream: true,
+          think,
+          numCtx: numCtx ?? null,
+          messageLength: lastUserText.length,
+          rewriteMs,
+          ragMs,
+          ragDocsCount,
+          ttfbMs: 0,
+          totalMs: Date.now() - perfStart,
+          chatMs: 0,
+        }
+        console.log('[ChatPerf]', JSON.stringify(perfPayload))
+        await this.logChatPerfIfEnabled(perfPayload)
+        return { kind: 'stream' }
+      }
+
+      await this.saveAssistantReply({
+        sessionId,
+        userContent,
+        assistantContent,
+      })
+      const perfPayload = {
+        timestamp: new Date().toISOString(),
+        model: requestData.model,
+        sessionId,
+        stream: false,
+        think,
+        numCtx: numCtx ?? null,
+        messageLength: lastUserText.length,
+        rewriteMs,
+        ragMs,
+        ragDocsCount,
+        ttfbMs: null,
+        totalMs: Date.now() - perfStart,
+        chatMs: 0,
+      }
+      console.log('[ChatPerf]', JSON.stringify(perfPayload))
+      await this.logChatPerfIfEnabled(perfPayload)
+      return {
+        kind: 'json',
+        body: {
+          model: requestData.model,
+          created_at: new Date().toISOString(),
+          message: {
+            role: 'assistant',
+            content: assistantContent,
+          },
+          done: true,
+          done_reason: 'stop',
+        },
+      }
+    }
 
     if (requestData.stream) {
       logger.debug(
@@ -489,9 +588,19 @@ export class ChatOrchestratorService {
     const systemMessages: Message[] = []
     const hasSystemMessage = messages.some((msg) => msg.role === 'system')
     if (!hasSystemMessage) {
+      const runtimeContext: string[] = [`Current date/time: ${nowText}${tz ? ` (${tz})` : ''}`]
+      if (assistantName) {
+        runtimeContext.push(`Your name is ${assistantName}.`)
+      }
+      if (activeUser) {
+        runtimeContext.push(`You are currently talking to ${activeUser}.`)
+      } else if (userName) {
+        runtimeContext.push(`The user's name is ${userName}.`)
+      }
+
       systemMessages.push({
         role: 'system',
-        content: `${baseSystemPrompt}\nCurrent date/time: ${nowText}${tz ? ` (${tz})` : ''}\nYour name is ${assistantName}. If asked your name, answer "I'm ${assistantName} — your assistant here. How can I help today?"${userName ? `\nThe user's name is ${userName}. If asked who the user is, answer "${userName}".` : ''}${activeUser ? `\nYou are currently talking to ${activeUser}.` : ''}\nDo not infer unresolved pronouns like she, he, they, it, this, or that into family members, devices, or tools.\nIf a target is ambiguous, ask a brief clarification or stay conversational.\nNever claim you inspected, listed, read, or changed something unless a real tool result or provided context gave you that information.`,
+        content: `${baseSystemPrompt}\n${runtimeContext.join('\n')}`,
       })
     }
 
@@ -508,7 +617,7 @@ export class ChatOrchestratorService {
       }
       systemMessages.push({
         role: 'system',
-        content: `User memory (facts, always true):\n${memoryLines.join('\n')}\nIf asked about the user or family, answer using these facts.`,
+        content: `User memory (facts, always true):\n${memoryLines.join('\n')}`,
       })
     }
 
@@ -523,54 +632,376 @@ export class ChatOrchestratorService {
 
   async prepareDirectAnswer(args: {
     lastUserText: string
+    model: string
     messages: Message[]
     profiles: Record<string, string[]>
     activeUser: string | null
     userName: string | null
     ragService: RagService
   }): Promise<DirectAnswerPlan> {
-    const { lastUserText, messages, profiles, activeUser, userName, ragService } = args
+    const { lastUserText, model, messages, profiles, activeUser, userName, ragService } = args
     const groundedText = resolveGroundedFollowUpText(lastUserText, messages)
+    if (isCapabilityQuestion(groundedText)) {
+      return this.createGroundedContextMessage(
+        'capabilities',
+        groundedText,
+        await this.describeRuntimeCapabilities()
+      )
+    }
+
+    if (isDesktopShortcutRequest(groundedText)) {
+      const openHandsAnswer = await this.openHandsWorkerService.delegateTask(groundedText)
+      return this.createGroundedContextMessage('openhands', groundedText, openHandsAnswer)
+    }
+
+    const autonomousTask = await this.tryAutonomousTaskLoop({
+      requestText: groundedText,
+      model,
+    })
+    if (autonomousTask) {
+      return this.createGroundedContextMessage(autonomousTask.source, groundedText, autonomousTask.result)
+    }
+
     try {
       const homeAssistantAnswer = await this.homeAssistantWorkerService.tryHandle(groundedText)
       if (homeAssistantAnswer) {
-        return { content: homeAssistantAnswer }
+        return this.createGroundedContextMessage('home_assistant', groundedText, homeAssistantAnswer)
+      }
+
+      const openHandsAnswer = await this.openHandsWorkerService.tryHandle(groundedText)
+      if (openHandsAnswer) {
+        return this.createGroundedContextMessage('openhands', groundedText, openHandsAnswer)
       }
 
       const systemWorkerAnswer = await this.systemWorkerService.tryHandle(groundedText)
       if (systemWorkerAnswer) {
-        return { content: systemWorkerAnswer }
+        return this.createGroundedContextMessage('system', groundedText, systemWorkerAnswer)
+      }
+
+      const terminalWorkerAnswer = await this.terminalWorkerService.tryHandle(groundedText)
+      if (terminalWorkerAnswer) {
+        return this.createGroundedContextMessage('terminal', groundedText, terminalWorkerAnswer)
       }
 
       const editWorkerAnswer = await this.editWorkerService.tryHandle(groundedText)
       if (editWorkerAnswer) {
-        return { content: editWorkerAnswer }
+        return this.createGroundedContextMessage('edit', groundedText, editWorkerAnswer)
       }
 
       const readWorkerAnswer = await this.readWorkerService.tryHandle(groundedText)
       if (readWorkerAnswer) {
-        return { content: readWorkerAnswer }
+        return this.createGroundedContextMessage('read', groundedText, readWorkerAnswer)
       }
     } catch (error) {
       logger.warn(
         `[ChatOrchestratorService] Read worker failed: ${error instanceof Error ? error.message : error}`
       )
-      return {
+      return this.createGroundedContextMessage(
+        'error',
+        groundedText,
+        error instanceof Error ? error.message : 'A tool execution error occurred.'
+      )
+    }
+
+    const memoryAnswer = buildMemoryContext(lastUserText, profiles, activeUser || userName || null)
+    if (memoryAnswer) {
+      return this.createGroundedContextMessage('memory', groundedText, memoryAnswer)
+    }
+
+    const libraryAnswer = await buildLibraryInventoryContext(lastUserText, ragService)
+    if (libraryAnswer) {
+      return this.createGroundedContextMessage('library', groundedText, libraryAnswer)
+    }
+
+    return null
+  }
+
+  createGroundedContextMessage(source: string, requestText: string, result: string): DirectAnswerPlan {
+    const directResponseText =
+      source === 'capabilities' ||
+      source === 'terminal' ||
+      source === 'missing_capability' ||
+      source === 'openhands'
+        ? result
+        : undefined
+    const sourceInstruction =
+      source === 'capabilities'
+        ? 'Summarize every major capability family present in the grounded result. Do not omit categories.'
+        : source === 'missing_capability'
+          ? 'State plainly that the task cannot be completed now, then list the specific missing tool or access needed from the grounded result.'
+        : source === 'task_loop'
+          ? 'Summarize the verified worker steps and final outcome plainly. Do not claim anything beyond the grounded result.'
+        : source === 'openhands'
+          ? 'Do not imply the delegated task is completed unless the grounded result explicitly says it is completed. If the grounded result only says the task was accepted or started, say only that.'
+        : source === 'terminal'
+          ? 'Include the verified command, exit code, and any stdout or stderr present in the grounded result. Do not omit the command result.'
+        : 'Answer the request from the grounded result only.'
+
+    return {
+      responseText: directResponseText,
+      contextMessage: {
+        role: 'system',
         content:
-          error instanceof Error
-            ? error.message
-            : 'I hit a problem while trying to inspect that.'
+          `The latest user request has already been grounded by the runtime ${source} layer.\n\n` +
+          `Grounded result:\n${result}\n\n` +
+          `Write the reply using only this grounded result. ` +
+          `Do not add names, files, actions, relationships, or conclusions that are not present in it. ` +
+          `If the grounded result is minimal, answer minimally. ` +
+          `If the grounded result says nothing was found, say that plainly. ` +
+          `${sourceInstruction}`,
+      },
+      promptMessage: {
+        role: 'user',
+        content:
+          `Original request: ${requestText}\n` +
+          `Grounded result: ${result}\n` +
+          `Answer the original request using only the grounded result. ${sourceInstruction}`,
+      },
+    }
+  }
+
+  async describeRuntimeCapabilities(): Promise<string> {
+    const openHands = await this.openHandsWorkerService.checkAvailable()
+    const homeAssistant = await this.homeAssistantWorkerService.describeCapabilities()
+    const hasHa = /Home Assistant worker capabilities:/i.test(homeAssistant)
+
+    return [
+      'Live capability summary:',
+      '- Chat and memory responses',
+      '- Offline RAG/library lookups when relevant context is available',
+      '- Home Assistant control and status tools',
+      '- Read tools for files, directories, logs, containers, and disk usage inside allowed app paths',
+      '- Edit tools for scoped file creation and text replacement inside allowed writable app paths',
+      '- System tools for time, uptime, service status, and managed-service restarts',
+      `- OpenHands delegation for isolated execution tasks: ${openHands.available ? 'available' : 'unavailable'}`,
+      'Current limits:',
+      '- No direct host home-directory or Desktop access is available',
+      '- No arbitrary host filesystem write access is available',
+      '- Replies must stay grounded in worker results and stored memory',
+      ...(hasHa ? ['', homeAssistant] : []),
+      '',
+      await this.openHandsWorkerService.describeCapabilities(),
+      '',
+      this.systemWorkerService.describeCapabilities(),
+      '',
+      this.terminalWorkerService.describeCapabilities(),
+      '',
+      this.readWorkerService.describeCapabilities(),
+      '',
+      this.editWorkerService.describeCapabilities(),
+    ].join('\n')
+  }
+
+  async tryAutonomousTaskLoop(_args: {
+    requestText: string
+    model: string
+  }): Promise<AutonomousTaskPlan> {
+    return null
+  }
+
+  async planAutonomousTaskStep(args: {
+    requestText: string
+    model: string
+    steps: AutonomousTaskStep[]
+    allowedWorkers: string[]
+    blockedRequests: string[]
+  }): Promise<AutonomousTaskDecision | null> {
+    const { requestText, model, steps, allowedWorkers, blockedRequests } = args
+    const stepHistory =
+      steps.length > 0
+        ? steps
+            .map((entry) =>
+              [
+                `Step ${entry.step}`,
+                `Worker: ${entry.worker}`,
+                `Request: ${entry.request}`,
+                `Result:\n${truncateAutonomousResult(entry.result)}`,
+              ].join('\n')
+            )
+            .join('\n\n')
+        : 'No grounded steps have been run yet.'
+
+    const baseMessages: Message[] = [
+      {
+        role: 'system',
+        content: [
+          'You are the bounded task planner for Quinn.',
+          'Decide exactly one next grounded action at a time.',
+          'Return JSON only. No markdown. No prose outside the JSON object.',
+          'Allowed JSON shapes:',
+          ...allowedWorkers.map((worker) => `{"action":"run","worker":"${worker}","request":"..."}`),
+          '{"action":"done","reason":"..."}',
+          '{"action":"cannot","reason":"..."}',
+          'Rules:',
+          '- Prefer inspection before modification.',
+          '- Never say done unless the prior grounded worker results verify the outcome.',
+          '- If the task cannot be completed with the current workers, return action=cannot and name the missing capability.',
+          '- The worker field must be exactly one worker name, never a list or placeholder.',
+          `- For this task, the only allowed workers are: ${allowedWorkers.join(', ')}.`,
+          '- Use request strings that the workers can already parse.',
+          '- For host terminal work, requests must start with "use ubuntu terminal to ...".',
+          '- The text after "use ubuntu terminal to" is executed directly as bash. It must be literal shell, not prose.',
+          '- Do not write requests like "navigate to" or "create a new directory". Write real shell such as "cd ~/Desktop && ls -la".',
+          '- For read work, use direct requests like "inspect container homeassistant" or "read file /app/...".',
+          '- Keep host-terminal work inside approved /home/nomad user-space paths.',
+          '- For a desktop shortcut, inspect existing .desktop launchers and the Home Assistant container first, then write and verify the new launcher on ~/Desktop.',
+          '- Do not say done after only listing the Desktop or inspecting the container.',
+          '- For a desktop shortcut, completion requires all of these grounded outcomes:',
+          '  1. inspect grounded info needed for the launcher',
+          '  2. write a .desktop file on ~/Desktop',
+          '  3. verify that specific .desktop file exists',
+          '- If a prior command failed, use the failure output to choose a better next command instead of repeating the same inspection.',
+          '- Do not repeat an identical worker request that already succeeded unless the prior result explicitly says it found nothing or failed.',
+          ...(blockedRequests.length > 0
+            ? [
+                '- These exact worker requests were already used and must not be returned again in this task:',
+                ...blockedRequests.map((entry) => `  - ${entry}`),
+              ]
+            : []),
+          '- Do not use sudo, apt, snap, systemctl, service, chown, or destructive commands.',
+          '- A .desktop launcher is a Desktop Entry text file that typically contains [Desktop Entry], Type=Application, Name, Exec, and Terminal=false.',
+        ].join('\n'),
+      },
+      {
+        role: 'user',
+        content: [
+          `Goal:\n${requestText}`,
+          '',
+          'Available grounded workers:',
+          ...allowedWorkers.map((worker) => `- ${worker}`),
+          '',
+          `Grounded steps so far:\n${stepHistory}`,
+          '',
+          `Planner hints:\n${buildAutonomousPlannerHints(requestText, steps, allowedWorkers, blockedRequests)}`,
+          '',
+          'Return the single best next action as JSON only.',
+        ].join('\n'),
+      },
+    ]
+
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const attemptMessages: Message[] =
+        attempt === 1
+          ? baseMessages
+          : [
+              ...baseMessages,
+              {
+                role: 'assistant',
+                content: 'Your last reply was invalid because it was not a single JSON object.',
+              },
+              {
+                role: 'user',
+                content:
+                  'Return exactly one valid JSON object now. No explanation. No bullet list. No markdown fences.',
+              },
+            ]
+
+      const plannerResponse = await this.ollamaService.chat({
+        model,
+        messages: attemptMessages,
+      })
+
+      console.log('[AutonomousPlanner]', plannerResponse.message.content)
+      const parsed = parseAutonomousTaskDecision(plannerResponse.message.content)
+      if (parsed) {
+        return parsed
       }
     }
 
-    const memoryAnswer = buildMemoryAnswer(lastUserText, profiles, activeUser || userName || null)
-    if (memoryAnswer) {
-      return { content: memoryAnswer }
+    return null
+  }
+
+  async runAutonomousWorkerStep(worker: string, request: string): Promise<string | null> {
+    switch (worker) {
+      case 'home_assistant':
+        return await this.homeAssistantWorkerService.tryHandle(request)
+      case 'system':
+        return await this.systemWorkerService.tryHandle(request)
+      case 'terminal':
+        return await this.terminalWorkerService.tryHandle(request)
+      case 'edit':
+        return await this.editWorkerService.tryHandle(request)
+      case 'read':
+        return await this.readWorkerService.tryHandle(request)
+      default:
+        return null
+    }
+  }
+
+  getAutonomousFallbackDecision(args: {
+    requestText: string
+    steps: AutonomousTaskStep[]
+    allowedWorkers: string[]
+  }): AutonomousTaskDecision | null {
+    const { requestText, steps, allowedWorkers } = args
+    if (!isDesktopShortcutRequest(requestText)) return null
+
+    const hasWorker = (worker: string) => allowedWorkers.includes(worker)
+    const hasContainerInspect = steps.some(
+      (step) => step.worker === 'read' && /inspect container homeassistant/i.test(step.request)
+    )
+    const hasLauncherLocationInspect = steps.some(
+      (step) =>
+        step.worker === 'host_terminal' &&
+        /(?:Desktop|\.local\/share\/applications)/i.test(step.request)
+    )
+    const hasTemplateInspect = steps.some(
+      (step) =>
+        step.worker === 'host_terminal' &&
+        /(?:sed -n|cat |head ).*\.desktop/i.test(step.request)
+    )
+    const hasWriteAttempt = steps.some(
+      (step) => step.worker === 'host_terminal' && isDesktopShortcutWriteRequest(step.request)
+    )
+    const hasVerificationAttempt = steps.some(
+      (step) =>
+        step.worker === 'host_terminal' &&
+        /Desktop\/home-assistant\.desktop/i.test(step.request) &&
+        /(?:ls\b|stat\b|test\s+-f|sed -n\b|cat\b)/i.test(step.request)
+    )
+
+    if (!hasContainerInspect && hasWorker('read')) {
+      return {
+        action: 'run',
+        worker: 'read',
+        request: 'inspect container homeassistant',
+      }
     }
 
-    const libraryAnswer = await buildLibraryInventoryAnswer(lastUserText, ragService)
-    if (libraryAnswer) {
-      return { content: libraryAnswer }
+    if (hasContainerInspect && !hasLauncherLocationInspect && hasWorker('host_terminal')) {
+      return {
+        action: 'run',
+        worker: 'host_terminal',
+        request:
+          'use ubuntu terminal to cd ~/ && ls -la Desktop ~/.local/share/applications',
+      }
+    }
+
+    if (hasLauncherLocationInspect && !hasTemplateInspect && hasWorker('host_terminal')) {
+      return {
+        action: 'run',
+        worker: 'host_terminal',
+        request:
+          'use ubuntu terminal to cd ~/ && for f in Desktop/*.desktop .local/share/applications/*.desktop; do [ -f "$f" ] && { echo "FILE:$f"; sed -n \'1,20p\' "$f"; break; }; done',
+      }
+    }
+
+    if (hasTemplateInspect && !hasWriteAttempt && hasWorker('host_terminal')) {
+      return {
+        action: 'run',
+        worker: 'host_terminal',
+        request:
+          'use ubuntu terminal to cd ~/ && cat > Desktop/home-assistant.desktop <<\'EOF\'\n[Desktop Entry]\nVersion=1.0\nType=Application\nName=Home Assistant\nComment=Open Home Assistant\nExec=xdg-open http://127.0.0.1:8123\nIcon=applications-internet\nTerminal=false\nCategories=Network;Utility;\nStartupNotify=true\nEOF\nchmod +x Desktop/home-assistant.desktop',
+      }
+    }
+
+    if (hasWriteAttempt && !hasVerificationAttempt && hasWorker('host_terminal')) {
+      return {
+        action: 'run',
+        worker: 'host_terminal',
+        request:
+          'use ubuntu terminal to cd ~/ && ls -l Desktop/home-assistant.desktop && sed -n \'1,20p\' Desktop/home-assistant.desktop',
+      }
     }
 
     return null
@@ -741,12 +1172,10 @@ export class ChatOrchestratorService {
     return { numCtx, keepAlive, maxTokens }
   }
 
-  async saveUserMessage(sessionId: number | null, messages: Message[]): Promise<string | null> {
-    if (!sessionId) return null
-    const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user')
-    if (!lastUserMsg) return null
-    await this.chatService.addMessage(sessionId, 'user', lastUserMsg.content)
-    return lastUserMsg.content
+  async saveUserMessage(sessionId: number | null, content: string | null): Promise<string | null> {
+    if (!sessionId || !content) return null
+    await this.chatService.addMessage(sessionId, 'user', content)
+    return content
   }
 
   sanitizeAssistantContent(text: string): string {
@@ -1302,19 +1731,19 @@ function cleanupFactText(text: string): string {
   return text.replace(/[.?!]+$/, '').replace(/\s+/g, ' ').trim()
 }
 
-function buildMemoryAnswer(question: string, profiles: Record<string, string[]>, activeUser: string | null): string | null {
+function buildMemoryContext(question: string, profiles: Record<string, string[]>, activeUser: string | null): string | null {
   const cleaned = question.trim().toLowerCase()
   if (!cleaned) return null
   const knownUsers = Object.keys(profiles)
   const activeFacts = activeUser ? profiles[activeUser] || [] : []
   if (/^(who am i|who am i\?|who am i today)$/.test(cleaned)) {
-    return activeUser ? `You are ${activeUser}.` : null
+    return activeUser ? `Active user identity: ${activeUser}` : null
   }
   if (/(tell me about myself|what do you know about me|what do you remember about me)/i.test(cleaned)) {
     if (!activeUser || activeFacts.length === 0) {
-      return "I don't have any saved facts about you yet. Tell me a bit about yourself and I'll remember."
+      return 'No saved facts are available yet for the active user.'
     }
-    return `Here's what I have saved about you, ${activeUser}:\n- ${activeFacts.join('\n- ')}`
+    return `Saved facts for ${activeUser}:\n- ${activeFacts.join('\n- ')}`
   }
   const relationQuery = parseRelationQuery(cleaned)
   if (relationQuery) {
@@ -1329,25 +1758,25 @@ function buildMemoryAnswer(question: string, profiles: Record<string, string[]>,
             if (relatedFacts.length === 0) return `- ${name}`
             return `- ${name}: ${relatedFacts.join('; ')}`
           })
-          return `Here's what I have saved about your children:\n${childSummaries.join('\n')}`
+          return `Saved facts for children of ${activeUser}:\n${childSummaries.join('\n')}`
         }
         const relatedFacts = profiles[match] || []
         if (relatedFacts.length > 0) {
-          return `Here's what I have saved about your ${relationQuery.label}, ${match}:\n- ${relatedFacts.join('\n- ')}`
+          return `Saved facts for ${relationQuery.label} ${match}:\n- ${relatedFacts.join('\n- ')}`
         }
       }
       if (relationQuery.relation === 'Child' && matches.length > 1) {
-        return `Your children are ${formatNameList(matches)}.`
+        return `Children of ${activeUser}: ${formatNameList(matches)}`
       }
-      return `Your ${relationQuery.label} is ${match}.`
+      return `${relationQuery.label} of ${activeUser}: ${match}`
     }
-    return `I don't have your ${relationQuery.label}'s name saved yet.`
+    return `No saved ${relationQuery.label} information was found for ${activeUser}.`
   }
   const mentioned = findNamedMemoryQuery(question, knownUsers)
   if (mentioned) {
     const facts = profiles[mentioned] || []
-    if (facts.length === 0) return `I don't have any saved facts about ${mentioned} yet.`
-    return `Here's what I have saved about ${mentioned}:\n- ${facts.join('\n- ')}`
+    if (facts.length === 0) return `No saved facts are available for ${mentioned}.`
+    return `Saved facts for ${mentioned}:\n- ${facts.join('\n- ')}`
   }
   return null
 }
@@ -1375,7 +1804,7 @@ function isLibraryInventoryQuestion(text: string): boolean {
   )
 }
 
-async function buildLibraryInventoryAnswer(question: string, ragService: RagService): Promise<string | null> {
+async function buildLibraryInventoryContext(question: string, ragService: RagService): Promise<string | null> {
   if (!isLibraryInventoryQuestion(question)) return null
   const wantsPdfOnly = /\bpdfs?\b/i.test(question)
   const fileNames = wantsPdfOnly
@@ -1383,14 +1812,12 @@ async function buildLibraryInventoryAnswer(question: string, ragService: RagServ
     : await ragService.getUploadedFileDisplayNames()
   if (fileNames.length === 0) {
     return wantsPdfOnly
-      ? "I don't have any uploaded PDFs in the knowledge base yet."
-      : "I don't have any uploaded files in the knowledge base yet."
+      ? 'Uploaded PDFs: none'
+      : 'Uploaded files: none'
   }
   const visibleNames = fileNames.slice(0, 20)
   const moreCount = fileNames.length - visibleNames.length
-  const heading = wantsPdfOnly
-    ? 'I currently have these uploaded PDFs in the knowledge base:'
-    : 'I currently have these uploaded files in the knowledge base:'
+  const heading = wantsPdfOnly ? 'Uploaded PDFs:' : 'Uploaded files:'
   const suffix = moreCount > 0 ? `\n- ...and ${moreCount} more` : ''
   return `${heading}\n- ${visibleNames.join('\n- ')}${suffix}`
 }
@@ -1491,6 +1918,225 @@ function resolveGroundedFollowUpText(currentText: string, messages: Message[]): 
   }
 
   return chain.join('\nFollow-up: ')
+}
+
+function isCapabilityQuestion(text: string): boolean {
+  const cleaned = text.trim().toLowerCase()
+  if (!cleaned) return false
+  return (
+    /\b(what|which|list|show|tell me)\b/.test(cleaned) &&
+    /\b(tool|tools|capabilit(?:y|ies)|access|available|can you do|what can you do|what kind of work)\b/.test(cleaned)
+  ) || /^(tools|capabilities|access)\??$/.test(cleaned)
+}
+
+function isDesktopShortcutRequest(text: string): boolean {
+  const cleaned = text.trim().toLowerCase()
+  if (!cleaned) return false
+  if (!/\b(shortcut|launcher)\b/.test(cleaned)) return false
+  return /\b(create|make|add|put)\b/.test(cleaned)
+}
+
+function normalizeAutonomousWorker(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s-]+/g, '_')
+}
+
+function parseAutonomousTaskDecision(raw: string): AutonomousTaskDecision | null {
+  const objectText = extractFirstJsonObject(raw)
+  if (!objectText) return null
+
+  try {
+    const parsed = JSON.parse(objectText)
+    const action = typeof parsed?.action === 'string' ? parsed.action.trim().toLowerCase() : ''
+
+    if (action === 'run') {
+      let worker = typeof parsed?.worker === 'string' ? normalizeAutonomousWorker(parsed.worker) : ''
+      const request = typeof parsed?.request === 'string' ? parsed.request.trim() : ''
+      if (!request) return null
+      if (!ALLOWED_AUTONOMOUS_WORKERS.has(worker)) {
+        worker = inferAutonomousWorkerFromRequest(request)
+      }
+      if (!worker || !ALLOWED_AUTONOMOUS_WORKERS.has(worker)) return null
+      return {
+        action: 'run',
+        worker,
+        request,
+      }
+    }
+
+    if (action === 'done') {
+      return {
+        action: 'done',
+        reason: typeof parsed?.reason === 'string' ? parsed.reason.trim() : undefined,
+      }
+    }
+
+    if (action === 'cannot') {
+      const reason = typeof parsed?.reason === 'string' ? parsed.reason.trim() : ''
+      if (!reason) return null
+      return {
+        action: 'cannot',
+        reason,
+      }
+    }
+  } catch {
+    return null
+  }
+
+  return null
+}
+
+function extractFirstJsonObject(raw: string): string | null {
+  const fencedMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/i)
+  const candidate = fencedMatch?.[1] || raw
+  const start = candidate.indexOf('{')
+  if (start === -1) return null
+
+  let depth = 0
+  let inString = false
+  let escaped = false
+
+  for (let index = start; index < candidate.length; index += 1) {
+    const char = candidate[index]
+
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (char === '"') {
+      inString = true
+      continue
+    }
+
+    if (char === '{') {
+      depth += 1
+      continue
+    }
+
+    if (char === '}') {
+      depth -= 1
+      if (depth === 0) {
+        return candidate.slice(start, index + 1)
+      }
+    }
+  }
+
+  return null
+}
+
+function truncateAutonomousResult(value: string): string {
+  const trimmed = value.trim()
+  if (trimmed.length <= 900) return trimmed
+  return `${trimmed.slice(0, 900)}\n...[truncated]`
+}
+
+function inferAutonomousWorkerFromRequest(request: string): string {
+  const trimmed = request.trim()
+  if (/^use ubuntu terminal to\b/i.test(trimmed) || /^(?:on ubuntu|on the host)\b/i.test(trimmed)) {
+    return 'host_terminal'
+  }
+  if (/^use terminal to\b/i.test(trimmed) || /^\s*(?:run|execute)\s+(?:the\s+)?(?:command|shell command)\b/i.test(trimmed)) {
+    return 'terminal'
+  }
+  if (
+    /\b(?:inspect|show|read|open|list|find|locate|search|grep|disk usage|storage usage|free space|logs)\b/i.test(
+      trimmed
+    )
+  ) {
+    return 'read'
+  }
+  if (
+    /\b(?:what time|what date|date|uptime|status of service|status of container|restart service|system status)\b/i.test(
+      trimmed
+    )
+  ) {
+    return 'system'
+  }
+  if (/\b(?:create|write|append|replace)\b/i.test(trimmed)) {
+    return 'edit'
+  }
+  if (
+    /\b(?:home assistant|shopping list|turn on|turn off|lock|unlock|state of|status of)\b/i.test(trimmed)
+  ) {
+    return 'home_assistant'
+  }
+  return ''
+}
+
+function isDesktopShortcutWriteRequest(request: string): boolean {
+  return /(?:cat\s*>|printf\b|tee\b|install\b|touch\b|chmod\b)/i.test(request)
+}
+
+function buildAutonomousPlannerHints(
+  requestText: string,
+  steps: AutonomousTaskStep[],
+  allowedWorkers: string[],
+  blockedRequests: string[] = []
+): string {
+  const hints: string[] = []
+  const lastStep = steps[steps.length - 1]
+
+  if (steps.length === 0) {
+    hints.push('- Start with the smallest inspection step that grounds the task.')
+  }
+
+  if (lastStep) {
+    hints.push(`- The most recent grounded worker was ${lastStep.worker}.`)
+    hints.push(`- Do not repeat this exact request unless its result explicitly requires a retry: ${lastStep.request}`)
+  }
+
+  if (isDesktopShortcutRequest(requestText)) {
+    const hasContainerInspect = steps.some(
+      (step) => step.worker === 'read' && /inspect container homeassistant/i.test(step.request)
+    )
+    const hasDesktopInspect = steps.some(
+      (step) =>
+        step.worker === 'host_terminal' &&
+        /(Desktop|\.local\/share\/applications|\.desktop\b)/i.test(`${step.request}\n${step.result}`)
+    )
+    const hasLauncherTemplateInspect = steps.some(
+      (step) =>
+        step.worker === 'host_terminal' &&
+        /(?:cat|sed|head)\b/i.test(step.request) &&
+        /\.desktop\b/i.test(step.request)
+    )
+    const hasWriteAttempt = steps.some(
+      (step) => step.worker === 'host_terminal' && isDesktopShortcutWriteRequest(step.request)
+    )
+
+    if (!hasContainerInspect) {
+      hints.push('- If you do not yet know how Home Assistant is exposed, inspect the Home Assistant container first.')
+    } else if (!hasDesktopInspect) {
+      hints.push('- The container has already been inspected. Do not inspect it again yet.')
+      hints.push('- Next, inspect launcher locations with the host terminal, such as ~/Desktop and ~/.local/share/applications.')
+      hints.push('- A good next request would inspect existing .desktop launchers or list those directories.')
+    } else if (!hasLauncherTemplateInspect) {
+      hints.push('- You already saw the launcher locations. Next, inspect an existing .desktop file with the host terminal so you can mirror its structure.')
+      hints.push('- Good targets include nomad.desktop on the Desktop or .desktop files in ~/.local/share/applications.')
+    } else if (!hasWriteAttempt) {
+      hints.push('- You already inspected a launcher template. Next, use the host terminal to write a real .desktop file on ~/Desktop and then verify it.')
+      hints.push('- A valid next host-terminal request can use a heredoc to write Desktop/home-assistant.desktop, then chmod +x it.')
+    } else {
+      hints.push('- A .desktop write has already been attempted. Next, verify that exact file exists and contains the expected launcher fields.')
+    }
+  }
+
+  if (blockedRequests.length > 0) {
+    hints.push('- These requests are blocked because they already happened and did not advance the task:')
+    hints.push(...blockedRequests.map((entry) => `  - ${entry}`))
+  }
+
+  if (!allowedWorkers.includes('host_terminal')) {
+    hints.push('- Host terminal is not available for this task, so stay within the allowed worker set.')
+  }
+
+  return hints.join('\n')
 }
 
 function relationOf(relation: string): string {

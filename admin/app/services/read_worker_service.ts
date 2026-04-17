@@ -8,12 +8,16 @@ type ReadTask =
   | { kind: 'tail_container_logs'; containerName: string }
   | { kind: 'read_file'; filePath: string }
   | { kind: 'list_directory'; dirPath: string }
+  | { kind: 'inspect_path'; targetPath: string }
   | { kind: 'list_home_assistant_directories' }
   | { kind: 'find_files'; query: string }
   | { kind: 'search_text'; pattern: string; targetPath?: string }
   | { kind: 'check_disk_usage'; targetPath?: string }
 
-const ALLOWED_READ_ROOTS = ['/app', '/tmp']
+const ALLOWED_READ_ROOTS = [
+  '/app',
+  '/tmp',
+]
 const MAX_FILE_BYTES = 64 * 1024
 const MAX_SEARCH_RESULTS = 12
 const MAX_WALK_RESULTS = 24
@@ -21,6 +25,22 @@ const MAX_WALK_RESULTS = 24
 @inject()
 export class ReadWorkerService {
   constructor(private dockerService: DockerService) {}
+
+  describeCapabilities(): string {
+    return [
+      'Read worker capabilities:',
+      '- Inspect Docker containers by name',
+      '- Read recent container logs',
+      '- Read text files under /app and /tmp',
+      '- List directories under /app and /tmp',
+      '- Inspect top-level Home Assistant /config directories through the Home Assistant container',
+      '- Find files under /app and /tmp',
+      '- Search text inside allowed read paths',
+      '- Report disk usage for allowed read paths',
+      'Read roots:',
+      `- ${ALLOWED_READ_ROOTS.join('\n- ')}`,
+    ].join('\n')
+  }
 
   async tryHandle(userText: string): Promise<string | null> {
     const task = this.parseTask(userText)
@@ -35,6 +55,8 @@ export class ReadWorkerService {
         return this.readTextFile(task.filePath)
       case 'list_directory':
         return this.listDirectory(task.dirPath)
+      case 'inspect_path':
+        return this.inspectPath(task.targetPath)
       case 'list_home_assistant_directories':
         return this.listHomeAssistantDirectories()
       case 'find_files':
@@ -74,9 +96,16 @@ export class ReadWorkerService {
 
     match =
       text.match(/\b(?:list|show)\s+(?:the\s+)?(?:directory|folder)\s+(.+)$/i) ||
-      text.match(/\b(?:list|show)\s+files in\s+(.+)$/i)
+      text.match(/\b(?:list|show)\s+files in\s+(.+)$/i) ||
+      text.match(/\b(?:list|show)\s+((?:\/app|\/tmp)[^\n]*)$/i)
     if (match) {
       return { kind: 'list_directory', dirPath: stripWrappingQuotes(match[1]) }
+    }
+
+    match =
+      text.match(/\b(?:inspect|show|open|read|list)\s+((?:\/app|\/tmp)[^\n]*)$/i)
+    if (match) {
+      return { kind: 'inspect_path', targetPath: stripWrappingQuotes(match[1]) }
     }
 
     if (
@@ -236,6 +265,18 @@ export class ReadWorkerService {
     return `Top-level Home Assistant config directories:\n${lines.join('\n')}`
   }
 
+  private async inspectPath(targetPath: string): Promise<string> {
+    const resolvedPath = this.resolveAllowedPath(targetPath)
+    const entryInfo = await stat(resolvedPath)
+    if (entryInfo.isDirectory()) {
+      return this.listDirectory(targetPath)
+    }
+    if (entryInfo.isFile()) {
+      return this.readTextFile(targetPath)
+    }
+    return `${targetPath} is neither a regular file nor a directory.`
+  }
+
   private async findFiles(query: string): Promise<string> {
     const normalizedQuery = query.trim().toLowerCase()
     const results: string[] = []
@@ -313,14 +354,37 @@ export class ReadWorkerService {
   private async resolveContainer(name: string) {
     const normalized = name.replace(/^\//, '')
     const containers = await this.dockerService.docker.listContainers({ all: true })
-    return containers.find((container) =>
-      container.Names.some((containerName) => containerName.replace(/^\//, '') === normalized)
-    ) || null
+    const exactMatch =
+      containers.find((container) =>
+        container.Names.some((containerName) => containerName.replace(/^\//, '') === normalized)
+      ) || null
+    if (exactMatch) return exactMatch
+
+    const containsMatch =
+      containers.find((container) =>
+        container.Names.some((containerName) => {
+          const cleanName = containerName.replace(/^\//, '')
+          return cleanName.includes(normalized) || normalized.includes(cleanName)
+        })
+      ) || null
+    if (containsMatch) return containsMatch
+
+    const fuzzyNeedle = normalized.replace(/[^a-z0-9]/gi, '').toLowerCase()
+    return (
+      containers.find((container) =>
+        container.Names.some((containerName) => {
+          const cleanName = containerName.replace(/^\//, '')
+          const fuzzyName = cleanName.replace(/[^a-z0-9]/gi, '').toLowerCase()
+          return fuzzyName.includes(fuzzyNeedle) || fuzzyNeedle.includes(fuzzyName)
+        })
+      ) || null
+    )
   }
 
   private resolveAllowedPath(requestedPath: string): string {
     const trimmed = requestedPath.trim()
-    const resolved = path.resolve(trimmed)
+    const normalizedInput = trimmed
+    const resolved = path.resolve(normalizedInput)
     const allowed = ALLOWED_READ_ROOTS.some((root) => resolved === root || resolved.startsWith(`${root}/`))
     if (!allowed) {
       throw new Error(`Path ${requestedPath} is outside the allowed read roots.`)

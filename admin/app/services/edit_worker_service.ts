@@ -12,6 +12,18 @@ const MAX_WRITE_BYTES = 64 * 1024
 
 @inject()
 export class EditWorkerService {
+  describeCapabilities(): string {
+    return [
+      'Edit worker capabilities:',
+      '- Create or overwrite text files',
+      '- Append text to files',
+      '- Replace exact text inside files',
+      'Write roots:',
+      `- ${ALLOWED_WRITE_ROOTS.join('\n- ')}`,
+      `Write size limit: ${MAX_WRITE_BYTES} bytes per operation`,
+    ].join('\n')
+  }
+
   async tryHandle(userText: string): Promise<string | null> {
     const task = this.parseTask(userText)
     if (!task) return null

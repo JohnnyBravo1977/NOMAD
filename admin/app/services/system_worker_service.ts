@@ -20,6 +20,20 @@ export class SystemWorkerService {
     private dockerService: DockerService
   ) {}
 
+  describeCapabilities(): string {
+    return [
+      'System worker capabilities:',
+      '- Report current time',
+      '- Report current date',
+      '- Report system uptime',
+      '- Summarize machine status',
+      '- Show installed service status',
+      '- Show status of a managed service',
+      '- Restart a managed service',
+      `Timezone: ${env.get('NOMAD_TIMEZONE') || 'system default'}`,
+    ].join('\n')
+  }
+
   async tryHandle(userText: string): Promise<string | null> {
     const task = this.parseTask(userText)
     if (!task) return null

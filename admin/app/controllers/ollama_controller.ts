@@ -1,5 +1,5 @@
-import { ChatOrchestratorService } from '#services/chat_orchestrator_service'
 import { DockerService } from '#services/docker_service'
+import { HermesRouterService } from '#services/hermes_router_service'
 import { OllamaService } from '#services/ollama_service'
 import { RagService } from '#services/rag_service'
 import Service from '#models/service'
@@ -15,7 +15,7 @@ import logger from '@adonisjs/core/services/logger'
 @inject()
 export default class OllamaController {
   constructor(
-    private chatOrchestratorService: ChatOrchestratorService,
+    private hermesRouterService: HermesRouterService,
     private dockerService: DockerService,
     private ollamaService: OllamaService,
     private ragService: RagService
@@ -57,7 +57,7 @@ export default class OllamaController {
     }
 
     try {
-      const chatResult = await this.chatOrchestratorService.runChatTurn({
+      const chatResult = await this.hermesRouterService.runChatTurn({
         requestData: reqData,
         ragService: this.ragService,
         perfStart,

@@ -19,6 +19,23 @@ type HaState = {
 export class HomeAssistantWorkerService {
   constructor(private homeAssistantService: HomeAssistantService) {}
 
+  async describeCapabilities(): Promise<string> {
+    const available = await this.homeAssistantService.isAvailable()
+    return [
+      'Home Assistant worker capabilities:',
+      available ? '- Home Assistant is currently reachable' : '- Home Assistant is currently not reachable',
+      '- List entities',
+      '- Read entity state by entity id or friendly name',
+      '- Turn compatible entities on or off',
+      '- Lock or unlock lock entities',
+      '- Add items to the shopping list',
+      '- Set thermostat-style target values for configured helpers',
+      '- Set thermostat mode for configured helpers',
+      '- Run grouped house actions such as lock all doors or turn off all lights',
+      '- Generate house status and house attention summaries',
+    ].join('\n')
+  }
+
   private isEntityId(value: string): boolean {
     return /^[a-z0-9_]+\.[a-z0-9_]+$/i.test(value.trim())
   }
