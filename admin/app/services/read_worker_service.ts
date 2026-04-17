@@ -33,6 +33,7 @@ export class ReadWorkerService {
       '- Read recent container logs',
       '- Read text files under /app and /tmp',
       '- List directories under /app and /tmp',
+      '- Inspect the local app workspace',
       '- Inspect top-level Home Assistant /config directories through the Home Assistant container',
       '- Find files under /app and /tmp',
       '- Search text inside allowed read paths',
@@ -72,6 +73,13 @@ export class ReadWorkerService {
 
   private parseTask(userText: string): ReadTask | null {
     const text = userText.trim()
+
+    if (
+      /\b(workspace|project|app workspace)\b/i.test(text) &&
+      /\b(?:inspect|show|list|what(?:'s| is).*(?:there|in it)|tell me what is there|look at)\b/i.test(text)
+    ) {
+      return { kind: 'list_directory', dirPath: '/app' }
+    }
 
     let match =
       text.match(/\b(?:inspect|check|look at|show)\s+(?:the\s+)?container\s+([a-zA-Z0-9._-]+)/i) ||
