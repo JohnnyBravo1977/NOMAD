@@ -75,6 +75,7 @@ export class ReadWorkerService {
 
     let match =
       text.match(/\b(?:inspect|check|look at|show)\s+(?:the\s+)?container\s+([a-zA-Z0-9._-]+)/i) ||
+      text.match(/\b(?:inspect|check|look at|show)\s+(?:the\s+)?([a-zA-Z0-9._-]+)\s+container\b/i) ||
       text.match(/\b(?:inspect|check|look at|show)\s+([a-zA-Z0-9._-]+)\s+container\b/i)
     if (match) {
       return { kind: 'inspect_container', containerName: match[1] }
@@ -82,6 +83,7 @@ export class ReadWorkerService {
 
     match =
       text.match(/\b(?:show|tail|read|inspect|check)\s+(?:the\s+)?logs(?:\s+for|\s+of)?\s+([a-zA-Z0-9._-]+)/i) ||
+      text.match(/\b(?:show|tail|read|inspect|check)\s+(?:the\s+)?([a-zA-Z0-9._-]+)\s+logs\b/i) ||
       text.match(/\b([a-zA-Z0-9._-]+)\s+logs\b/i)
     if (match) {
       return { kind: 'tail_container_logs', containerName: match[1] }

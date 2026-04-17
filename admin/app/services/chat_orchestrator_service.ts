@@ -719,9 +719,14 @@ export class ChatOrchestratorService {
   createGroundedContextMessage(source: string, requestText: string, result: string): DirectAnswerPlan {
     const directResponseText =
       source === 'capabilities' ||
+      source === 'read' ||
+      source === 'edit' ||
+      source === 'system' ||
+      source === 'home_assistant' ||
       source === 'terminal' ||
       source === 'missing_capability' ||
-      source === 'openhands'
+      source === 'openhands' ||
+      source === 'error'
         ? result
         : undefined
     const sourceInstruction =
