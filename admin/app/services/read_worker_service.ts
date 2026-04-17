@@ -176,7 +176,7 @@ export class ReadWorkerService {
 
     const lines = [
       `I checked the ${containerName} container.`,
-      `Status: ${state}`,
+      `It is currently ${state}.`,
       `Image: ${image}`,
     ]
     if (ports.length > 0) lines.push(`Ports: ${ports.join(', ')}`)
@@ -207,7 +207,7 @@ export class ReadWorkerService {
       return `I checked ${containerName}, but there weren't any recent logs to show.`
     }
 
-    return `I pulled the latest logs from ${containerName}:\n${cleaned.join('\n')}`
+    return `I pulled the latest logs from ${containerName}. Here are the newest lines:\n${cleaned.join('\n')}`
   }
 
   private async readTextFile(filePath: string): Promise<string> {
@@ -219,7 +219,7 @@ export class ReadWorkerService {
 
     const content = await readFile(resolvedPath, 'utf-8')
     const trimmed = content.length > MAX_FILE_BYTES ? `${content.slice(0, MAX_FILE_BYTES)}\n...[truncated]` : content
-    return `I opened ${resolvedPath}. Here is the file:\n${trimmed}`
+    return `I opened ${resolvedPath}. Here is the current file content:\n${trimmed}`
   }
 
   private async listDirectory(dirPath: string): Promise<string> {
@@ -230,13 +230,23 @@ export class ReadWorkerService {
     }
 
     const entries = await readdir(resolvedPath, { withFileTypes: true })
-    const names = entries
+    const sortedEntries = entries
       .sort((a, b) => a.name.localeCompare(b.name))
       .slice(0, 50)
-      .map((entry) => `${entry.isDirectory() ? '[dir]' : '[file]'} ${entry.name}`)
+    const directories = sortedEntries.filter((entry) => entry.isDirectory()).map((entry) => `${entry.name}/`)
+    const files = sortedEntries.filter((entry) => !entry.isDirectory()).map((entry) => entry.name)
 
-    return names.length > 0
-      ? `I checked ${resolvedPath}. Here is what is there:\n${names.join('\n')}`
+    const lines = [`I checked ${resolvedPath}.`]
+    lines.push(`I found ${sortedEntries.length} top-level item${sortedEntries.length === 1 ? '' : 's'}.`)
+    if (directories.length > 0) {
+      lines.push(`Directories: ${directories.join(', ')}`)
+    }
+    if (files.length > 0) {
+      lines.push(`Files: ${files.join(', ')}`)
+    }
+
+    return sortedEntries.length > 0
+      ? lines.join('\n')
       : `${resolvedPath} is empty.`
   }
 
