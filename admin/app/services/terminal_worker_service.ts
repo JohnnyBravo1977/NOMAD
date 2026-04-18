@@ -81,7 +81,8 @@ export class TerminalWorkerService {
     }
   }
 
-  private async runCommand(command: string): Promise<string> {
+  async runCommand(command: string): Promise<string> {
+    this.assertCommandAllowed(command)
     const result = await execShell(command)
     const parts = [
       `Command: ${command}`,

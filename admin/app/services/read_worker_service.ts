@@ -4,6 +4,7 @@ import { readFile, readdir, stat } from 'fs/promises'
 import path from 'node:path'
 
 type ReadTask =
+  | { kind: 'list_containers' }
   | { kind: 'inspect_container'; containerName: string }
   | { kind: 'tail_container_logs'; containerName: string }
   | { kind: 'read_file'; filePath: string }
@@ -29,6 +30,7 @@ export class ReadWorkerService {
   describeCapabilities(): string {
     return [
       'Read worker capabilities:',
+      '- List Docker containers',
       '- Inspect Docker containers by name',
       '- Read recent container logs',
       '- Read text files under /app and /tmp',
@@ -48,6 +50,8 @@ export class ReadWorkerService {
     if (!task) return null
 
     switch (task.kind) {
+      case 'list_containers':
+        return this.listContainers()
       case 'inspect_container':
         return this.inspectContainer(task.containerName)
       case 'tail_container_logs':
@@ -73,6 +77,10 @@ export class ReadWorkerService {
 
   private parseTask(userText: string): ReadTask | null {
     const text = userText.trim()
+
+    if (/\b(?:list|show)\s+(?:all\s+)?containers\b/i.test(text) || /\bwhat containers\b/i.test(text)) {
+      return { kind: 'list_containers' }
+    }
 
     if (
       /\b(workspace|project|app workspace)\b/i.test(text) &&
@@ -154,7 +162,30 @@ export class ReadWorkerService {
     return null
   }
 
-  private async inspectContainer(containerName: string): Promise<string> {
+  async listContainers(): Promise<string> {
+    const containers = await this.dockerService.docker.listContainers({ all: true })
+    if (containers.length === 0) {
+      return `I couldn't find any Docker containers.`
+    }
+
+    const lines = containers
+      .sort((a, b) => {
+        const aName = a.Names?.[0]?.replace(/^\//, '') || a.Id
+        const bName = b.Names?.[0]?.replace(/^\//, '') || b.Id
+        return aName.localeCompare(bName)
+      })
+      .slice(0, 30)
+      .map((container) => {
+        const name = container.Names?.[0]?.replace(/^\//, '') || container.Id
+        const state = container.State || 'unknown'
+        const image = container.Image || 'unknown'
+        return `${name} — ${state} — ${image}`
+      })
+
+    return `I checked the current Docker containers. Here is what I found:\n${lines.join('\n')}`
+  }
+
+  async inspectContainer(containerName: string): Promise<string> {
     const container = await this.resolveContainer(containerName)
     if (!container) {
       return `I couldn't find a container named ${containerName}.`
@@ -185,7 +216,7 @@ export class ReadWorkerService {
     return lines.join('\n')
   }
 
-  private async tailContainerLogs(containerName: string): Promise<string> {
+  async tailContainerLogs(containerName: string): Promise<string> {
     const container = await this.resolveContainer(containerName)
     if (!container) {
       return `I couldn't find a container named ${containerName}.`
@@ -210,7 +241,7 @@ export class ReadWorkerService {
     return `I pulled the latest logs from ${containerName}. Here are the newest lines:\n${cleaned.join('\n')}`
   }
 
-  private async readTextFile(filePath: string): Promise<string> {
+  async readTextFile(filePath: string): Promise<string> {
     const resolvedPath = this.resolveAllowedPath(filePath)
     const fileInfo = await stat(resolvedPath)
     if (!fileInfo.isFile()) {
@@ -222,7 +253,7 @@ export class ReadWorkerService {
     return `I opened ${resolvedPath}. Here is the current file content:\n${trimmed}`
   }
 
-  private async listDirectory(dirPath: string): Promise<string> {
+  async listDirectory(dirPath: string): Promise<string> {
     const resolvedPath = this.resolveAllowedPath(dirPath)
     const dirInfo = await stat(resolvedPath)
     if (!dirInfo.isDirectory()) {
@@ -267,7 +298,7 @@ export class ReadWorkerService {
     return parts.join(' ')
   }
 
-  private async listHomeAssistantDirectories(): Promise<string> {
+  async listHomeAssistantDirectories(): Promise<string> {
     const container = await this.resolveContainer('homeassistant')
     if (!container) {
       return `I couldn't find the Home Assistant container.`
@@ -302,7 +333,7 @@ export class ReadWorkerService {
     return `Top-level Home Assistant config directories:\n${lines.join('\n')}`
   }
 
-  private async inspectPath(targetPath: string): Promise<string> {
+  async inspectPath(targetPath: string): Promise<string> {
     const resolvedPath = this.resolveAllowedPath(targetPath)
     const entryInfo = await stat(resolvedPath)
     if (entryInfo.isDirectory()) {
@@ -314,7 +345,7 @@ export class ReadWorkerService {
     return `${targetPath} is neither a regular file nor a directory.`
   }
 
-  private async findFiles(query: string): Promise<string> {
+  async findFiles(query: string): Promise<string> {
     const normalizedQuery = query.trim().toLowerCase()
     const results: string[] = []
 
@@ -336,7 +367,7 @@ export class ReadWorkerService {
     return `I found these matching files:\n${results.join('\n')}`
   }
 
-  private async searchText(pattern: string, targetPath?: string): Promise<string> {
+  async searchText(pattern: string, targetPath?: string): Promise<string> {
     const roots = targetPath ? [this.resolveAllowedPath(targetPath)] : ALLOWED_READ_ROOTS
     const normalizedPattern = pattern.toLowerCase()
     const matches: string[] = []
@@ -371,7 +402,7 @@ export class ReadWorkerService {
     return `I found these matches for "${pattern}":\n${matches.join('\n')}`
   }
 
-  private async checkDiskUsage(targetPath?: string): Promise<string> {
+  async checkDiskUsage(targetPath?: string): Promise<string> {
     const roots = targetPath ? [this.resolveAllowedPath(targetPath)] : ALLOWED_READ_ROOTS
     const lines: string[] = []
 

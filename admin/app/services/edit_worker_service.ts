@@ -78,7 +78,7 @@ export class EditWorkerService {
     return null
   }
 
-  private async writeTextFile(filePath: string, content: string): Promise<string> {
+  async writeTextFile(filePath: string, content: string): Promise<string> {
     const resolvedPath = this.resolveWritablePath(filePath)
     this.assertContentSize(content)
     await mkdir(path.dirname(resolvedPath), { recursive: true })
@@ -86,7 +86,7 @@ export class EditWorkerService {
     return `Wrote ${content.length} characters to ${resolvedPath}.`
   }
 
-  private async appendTextFile(filePath: string, content: string): Promise<string> {
+  async appendTextFile(filePath: string, content: string): Promise<string> {
     const resolvedPath = this.resolveWritablePath(filePath)
     this.assertContentSize(content)
     await mkdir(path.dirname(resolvedPath), { recursive: true })
@@ -94,7 +94,7 @@ export class EditWorkerService {
     return `Appended ${content.length} characters to ${resolvedPath}.`
   }
 
-  private async replaceInTextFile(filePath: string, search: string, replace: string): Promise<string> {
+  async replaceInTextFile(filePath: string, search: string, replace: string): Promise<string> {
     const resolvedPath = this.resolveWritablePath(filePath)
     const fileInfo = await stat(resolvedPath)
     if (!fileInfo.isFile()) {
