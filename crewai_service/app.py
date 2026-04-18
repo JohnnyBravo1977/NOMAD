@@ -78,6 +78,18 @@ class RestartAndVerifyServiceInput(BaseModel):
     )
 
 
+class InspectLogsConfigAndFilesInput(BaseModel):
+    container_name: str = Field(
+        ...,
+        description="Container name to inspect for logs, config, and file structure",
+        validation_alias=AliasChoices("container_name", "container"),
+    )
+
+
+class DiagnoseHomeAssistantInput(BaseModel):
+    pass
+
+
 def get_docker() -> docker.DockerClient:
     return docker.from_env()
 
@@ -335,6 +347,31 @@ def render_restart_and_verify_service_result(service_name: str, steps: list[tupl
     )
 
 
+def render_inspect_logs_config_and_files_result(container_name: str, steps: list[tuple[str, str]]) -> str:
+    evidence = "\n\n".join(format_section(title, result) for title, result in steps)
+    return "\n".join(
+        [
+            f"I inspected logs, config, and file structure for {container_name}.",
+            "",
+            "Grounded evidence:",
+            evidence,
+        ]
+    )
+
+
+def render_diagnose_home_assistant_result(steps: list[tuple[str, str]]) -> str:
+    evidence = "\n\n".join(format_section(title, result) for title, result in steps)
+    return "\n".join(
+        [
+            "I diagnosed the Home Assistant setup.",
+            "I checked the container, recent logs, and the current /config structure.",
+            "",
+            "Grounded evidence:",
+            evidence,
+        ]
+    )
+
+
 def run_diagnose_container(payload: DiagnoseContainerInput) -> str:
     steps = [
         ("Step 1 — container inspection", InspectContainerTool()._run(payload.container_name)),
@@ -387,6 +424,33 @@ def run_restart_and_verify_service(payload: RestartAndVerifyServiceInput) -> str
     return render_restart_and_verify_service_result(payload.service_name, steps)
 
 
+def run_inspect_logs_config_and_files(payload: InspectLogsConfigAndFilesInput) -> str:
+    steps = [
+        ("Step 1 — container inspection", InspectContainerTool()._run(payload.container_name)),
+        ("Step 2 — recent logs", ContainerLogsTool()._run(payload.container_name)),
+    ]
+    if "homeassistant" in payload.container_name.lower():
+        steps.append(
+            (
+                "Step 3 — config structure",
+                HomeAssistantStructureTool()._run(payload.container_name),
+            )
+        )
+
+    return render_inspect_logs_config_and_files_result(payload.container_name, steps)
+
+
+def run_diagnose_home_assistant(_payload: DiagnoseHomeAssistantInput) -> str:
+    container_name = "homeassistant"
+    steps = [
+        ("Step 1 — container inspection", InspectContainerTool()._run(container_name)),
+        ("Step 2 — recent logs", ContainerLogsTool()._run(container_name)),
+        ("Step 3 — config structure", HomeAssistantStructureTool()._run(container_name)),
+    ]
+
+    return render_diagnose_home_assistant_result(steps)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -416,6 +480,12 @@ def execute_job(job_id: str, request_payload: dict):
         elif request.tool == "restart_and_verify_service":
             payload = RestartAndVerifyServiceInput.model_validate(request.input)
             result = run_restart_and_verify_service(payload)
+        elif request.tool == "inspect_logs_config_and_files":
+            payload = InspectLogsConfigAndFilesInput.model_validate(request.input)
+            result = run_inspect_logs_config_and_files(payload)
+        elif request.tool == "diagnose_home_assistant":
+            payload = DiagnoseHomeAssistantInput.model_validate(request.input)
+            result = run_diagnose_home_assistant(payload)
         else:
             raise ValueError(f"Unsupported worker-flow tool: {request.tool}")
         write_job(
@@ -444,7 +514,13 @@ def execute_job(job_id: str, request_payload: dict):
 
 @app.post("/run")
 def run_worker_flow(request: RunRequest):
-    if request.tool not in {"diagnose_container", "patch_file_and_verify", "restart_and_verify_service"}:
+    if request.tool not in {
+        "diagnose_container",
+        "patch_file_and_verify",
+        "restart_and_verify_service",
+        "inspect_logs_config_and_files",
+        "diagnose_home_assistant",
+    }:
         raise HTTPException(status_code=400, detail=f"Unsupported worker-flow tool: {request.tool}")
 
     job_id = uuid4().hex

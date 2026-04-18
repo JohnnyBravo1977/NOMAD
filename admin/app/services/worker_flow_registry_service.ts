@@ -5,11 +5,15 @@ export type WorkerFlowToolName =
   | 'diagnose_container'
   | 'patch_file_and_verify'
   | 'restart_and_verify_service'
+  | 'inspect_logs_config_and_files'
+  | 'diagnose_home_assistant'
 
 type WorkerFlowMatch =
   | { tool: 'diagnose_container'; containerName: string }
   | { tool: 'patch_file_and_verify'; filePath: string; search: string; replace: string; serviceName?: string }
   | { tool: 'restart_and_verify_service'; serviceName: string }
+  | { tool: 'inspect_logs_config_and_files'; containerName: string }
+  | { tool: 'diagnose_home_assistant' }
 
 @inject()
 export class WorkerFlowRegistryService {
@@ -22,6 +26,8 @@ export class WorkerFlowRegistryService {
       '- diagnose_container',
       '- patch_file_and_verify',
       '- restart_and_verify_service',
+      '- inspect_logs_config_and_files',
+      '- diagnose_home_assistant',
       'Worker-flow tool model:',
       '- A worker-flow tool runs a bounded multi-step job using sub-tools, then returns one grounded result.',
       '- This is the execution lane where CrewAI lives without affecting direct tools.',
@@ -79,6 +85,24 @@ export class WorkerFlowRegistryService {
             },
           }),
         }
+      case 'inspect_logs_config_and_files':
+        return {
+          tool: match.tool,
+          result: await this.crewAIWorkerService.runTool({
+            tool: 'inspect_logs_config_and_files',
+            input: {
+              container_name: match.containerName,
+            },
+          }),
+        }
+      case 'diagnose_home_assistant':
+        return {
+          tool: match.tool,
+          result: await this.crewAIWorkerService.runTool({
+            tool: 'diagnose_home_assistant',
+            input: {},
+          }),
+        }
       default:
         return null
     }
@@ -117,6 +141,24 @@ export class WorkerFlowRegistryService {
         tool: 'restart_and_verify_service',
         serviceName: match[1],
       }
+    }
+
+    match =
+      text.match(/\binspect\s+logs,\s*config,\s*(?:and\s+)?files\s+(?:for\s+)?([a-zA-Z0-9._-]+)/i) ||
+      text.match(/\binspect_logs_config_and_files\s+([a-zA-Z0-9._-]+)/i) ||
+      text.match(/\binspect\s+([a-zA-Z0-9._-]+)\s+logs,\s*config,\s*(?:and\s+)?files/i)
+    if (match) {
+      return {
+        tool: 'inspect_logs_config_and_files',
+        containerName: match[1],
+      }
+    }
+
+    if (
+      /\bdiagnose\s+(?:home assistant|homeassistant)\b/i.test(text) ||
+      /\bdiagnose_home_assistant\b/i.test(text)
+    ) {
+      return { tool: 'diagnose_home_assistant' }
     }
 
     return null
