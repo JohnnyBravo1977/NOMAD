@@ -168,13 +168,15 @@ export class ReadWorkerService {
       return `I couldn't find any Docker containers.`
     }
 
-    const lines = containers
-      .sort((a, b) => {
-        const aName = a.Names?.[0]?.replace(/^\//, '') || a.Id
-        const bName = b.Names?.[0]?.replace(/^\//, '') || b.Id
-        return aName.localeCompare(bName)
-      })
-      .slice(0, 30)
+    const running = containers.filter((container) => (container.State || '').toLowerCase() === 'running')
+    const others = containers.filter((container) => (container.State || '').toLowerCase() !== 'running')
+    const visible = running.sort((a, b) => {
+      const aName = a.Names?.[0]?.replace(/^\//, '') || a.Id
+      const bName = b.Names?.[0]?.replace(/^\//, '') || b.Id
+      return aName.localeCompare(bName)
+    })
+      .slice(0, 20)
+    const lines = visible
       .map((container) => {
         const name = container.Names?.[0]?.replace(/^\//, '') || container.Id
         const state = container.State || 'unknown'
@@ -182,7 +184,16 @@ export class ReadWorkerService {
         return `${name} — ${state} — ${image}`
       })
 
-    return `I checked the current Docker containers. Here is what I found:\n${lines.join('\n')}`
+    const parts = [
+      `I checked the current Docker containers.`,
+      `${running.length} running, ${others.length} not running.`,
+      `Here is what I found:\n${lines.join('\n')}`,
+    ]
+    if (others.length > 0) {
+      parts.push(`I left out ${others.length} non-running container${others.length === 1 ? '' : 's'} to keep this readable.`)
+    }
+
+    return parts.join('\n')
   }
 
   async inspectContainer(containerName: string): Promise<string> {
@@ -228,7 +239,7 @@ export class ReadWorkerService {
     const rawText = Buffer.isBuffer(logBuffer)
       ? demuxDockerLogBuffer(logBuffer)
       : String(logBuffer)
-    const cleaned = stripDockerLogFrames(rawText)
+    const cleaned = stripAnsi(stripDockerLogFrames(rawText))
       .split('\n')
       .map((line) => line.trimEnd())
       .filter(Boolean)
@@ -249,8 +260,11 @@ export class ReadWorkerService {
     }
 
     const content = await readFile(resolvedPath, 'utf-8')
-    const trimmed = content.length > MAX_FILE_BYTES ? `${content.slice(0, MAX_FILE_BYTES)}\n...[truncated]` : content
-    return `I opened ${resolvedPath}. Here is the current file content:\n${trimmed}`
+    const isTruncated = content.length > MAX_FILE_BYTES
+    const trimmed = isTruncated ? `${content.slice(0, MAX_FILE_BYTES)}\n...[truncated]` : content
+    return isTruncated
+      ? `I opened ${resolvedPath}. The file is large, so here is the beginning of it:\n${trimmed}`
+      : `I opened ${resolvedPath}. Here is the current file content:\n${trimmed}`
   }
 
   async listDirectory(dirPath: string): Promise<string> {
@@ -504,6 +518,10 @@ function stripWrappingQuotes(value: string): string {
 
 function stripDockerLogFrames(text: string): string {
   return text.replace(/[\u0000-\u0008\u000B-\u001F]/g, '')
+}
+
+function stripAnsi(text: string): string {
+  return text.replace(/\u001b\[[0-9;]*m/g, '')
 }
 
 function demuxDockerLogBuffer(buffer: Buffer): string {

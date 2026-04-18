@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -78,6 +79,10 @@ def normalize_service_name(raw_name: str) -> str:
     if value.startswith("nomad_"):
         return value
     return f"nomad_{value}"
+
+
+def strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
 
 def resolve_allowed_path(requested_path: str) -> Path:
@@ -163,7 +168,7 @@ class ContainerLogsTool(BaseTool):
         if not container:
             return f"I couldn't find a container named {container_name}."
         raw = container.logs(stdout=True, stderr=True, tail=40)
-        text = raw.decode("utf-8", errors="replace").strip()
+        text = strip_ansi(raw.decode("utf-8", errors="replace")).strip()
         lines = [line for line in text.splitlines() if line.strip()][-20:]
         if not lines:
             return f"I checked {container.name}, but there were no recent log lines to show."
@@ -291,10 +296,18 @@ def render_diagnose_container_result(container_name: str, steps: list[tuple[str,
 
 
 def render_patch_file_and_verify_result(file_path: str, steps: list[tuple[str, str]]) -> str:
+    patch_result = next((result for title, result in steps if title == "Step 2 — patch result"), "")
+    if "couldn't find" in patch_result:
+        intro = (
+            f"I ran the patch_file_and_verify flow for {file_path}, but there was nothing to replace with the text you gave me."
+        )
+    else:
+        intro = f"I ran the patch_file_and_verify flow for {file_path}."
+
     evidence = "\n\n".join(format_section(title, result) for title, result in steps)
     return "\n".join(
         [
-            f"I ran the patch_file_and_verify flow for {file_path}.",
+            intro,
             "",
             "Grounded evidence:",
             evidence,
