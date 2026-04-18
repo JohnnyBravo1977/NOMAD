@@ -652,14 +652,25 @@ export class ChatOrchestratorService {
       )
     }
 
-    const directToolAnswer = await this.directToolRegistryService.tryHandle(groundedText)
-    if (directToolAnswer) {
-      return this.createGroundedContextMessage('direct_tool', groundedText, directToolAnswer.result)
-    }
+    try {
+      const directToolAnswer = await this.directToolRegistryService.tryHandle(groundedText)
+      if (directToolAnswer) {
+        return this.createGroundedContextMessage('direct_tool', groundedText, directToolAnswer.result)
+      }
 
-    const workerFlowAnswer = await this.workerFlowRegistryService.tryHandle(groundedText)
-    if (workerFlowAnswer) {
-      return this.createGroundedContextMessage('worker_flow', groundedText, workerFlowAnswer.result)
+      const workerFlowAnswer = await this.workerFlowRegistryService.tryHandle(groundedText)
+      if (workerFlowAnswer) {
+        return this.createGroundedContextMessage('worker_flow', groundedText, workerFlowAnswer.result)
+      }
+    } catch (error) {
+      logger.warn(
+        `[ChatOrchestratorService] Tool routing failed: ${error instanceof Error ? error.message : error}`
+      )
+      return this.createGroundedContextMessage(
+        'error',
+        groundedText,
+        error instanceof Error ? error.message : 'A tool execution error occurred.'
+      )
     }
 
     const autonomousTask = await this.tryAutonomousTaskLoop({
@@ -794,7 +805,7 @@ export class ChatOrchestratorService {
       '',
       this.directToolRegistryService.describeTools(),
       '',
-      this.workerFlowRegistryService.describeTools(),
+      await this.workerFlowRegistryService.describeTools(),
       ...(hasHa ? ['', homeAssistant] : []),
       '',
       this.systemWorkerService.describeCapabilities(),
