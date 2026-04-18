@@ -13,8 +13,5 @@ export const SETTINGS_KEYS: KVStoreKey[] = [
   'ai.activeUserName',
   'ai.userProfilesLastSync',
   'ai.remoteOllamaUrl',
-  'ai.openhandsUrl',
-  'ai.openhandsLastConversationId',
-  'ai.openhandsWarmConversationId',
   'ai.ollamaFlashAttention',
 ]

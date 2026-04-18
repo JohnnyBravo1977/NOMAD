@@ -16,9 +16,6 @@ export const KV_STORE_SCHEMA = {
   'ai.userProfilesLastSync':    'string',
   'gpu.type':                   'string',
   'ai.remoteOllamaUrl':         'string',
-  'ai.openhandsUrl':            'string',
-  'ai.openhandsLastConversationId': 'string',
-  'ai.openhandsWarmConversationId': 'string',
   'ai.ollamaFlashAttention':    'boolean',
 } as const
 

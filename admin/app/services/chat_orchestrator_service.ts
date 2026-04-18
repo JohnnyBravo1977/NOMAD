@@ -7,7 +7,6 @@ import { ChatService } from '#services/chat_service'
 import { OllamaService } from '#services/ollama_service'
 import { EditWorkerService } from '#services/edit_worker_service'
 import { HomeAssistantWorkerService } from '#services/home_assistant_worker_service'
-import { OpenHandsWorkerService } from '#services/openhands_worker_service'
 import { ReadWorkerService } from '#services/read_worker_service'
 import { SystemWorkerService } from '#services/system_worker_service'
 import { TerminalWorkerService } from '#services/terminal_worker_service'
@@ -143,7 +142,6 @@ export class ChatOrchestratorService {
     private chatService: ChatService,
     private ollamaService: OllamaService,
     private homeAssistantWorkerService: HomeAssistantWorkerService,
-    private openHandsWorkerService: OpenHandsWorkerService,
     private terminalWorkerService: TerminalWorkerService,
     private editWorkerService: EditWorkerService,
     private readWorkerService: ReadWorkerService,
@@ -650,8 +648,17 @@ export class ChatOrchestratorService {
     }
 
     if (isDesktopShortcutRequest(groundedText)) {
-      const openHandsAnswer = await this.openHandsWorkerService.delegateTask(groundedText)
-      return this.createGroundedContextMessage('openhands', groundedText, openHandsAnswer)
+      return this.createGroundedContextMessage(
+        'missing_capability',
+        groundedText,
+        [
+          'Missing capability: verified host Ubuntu desktop shortcut creation is disabled right now.',
+          'Current status:',
+          '- No host Desktop action bridge is available.',
+          '- No direct host home-directory write access is available.',
+          '- Quinn can only work inside the current local worker boundaries.',
+        ].join('\n')
+      )
     }
 
     const autonomousTask = await this.tryAutonomousTaskLoop({
@@ -666,11 +673,6 @@ export class ChatOrchestratorService {
       const homeAssistantAnswer = await this.homeAssistantWorkerService.tryHandle(groundedText)
       if (homeAssistantAnswer) {
         return this.createGroundedContextMessage('home_assistant', groundedText, homeAssistantAnswer)
-      }
-
-      const openHandsAnswer = await this.openHandsWorkerService.tryHandle(groundedText)
-      if (openHandsAnswer) {
-        return this.createGroundedContextMessage('openhands', groundedText, openHandsAnswer)
       }
 
       const systemWorkerAnswer = await this.systemWorkerService.tryHandle(groundedText)
@@ -722,7 +724,6 @@ export class ChatOrchestratorService {
       source === 'read' ||
       source === 'terminal' ||
       source === 'missing_capability' ||
-      source === 'openhands' ||
       source === 'error'
         ? result
         : undefined
@@ -730,11 +731,9 @@ export class ChatOrchestratorService {
       source === 'capabilities'
         ? 'Summarize every major capability family present in the grounded result. Do not omit categories.'
         : source === 'missing_capability'
-          ? 'State plainly that the task cannot be completed now, then list the specific missing tool or access needed from the grounded result.'
+        ? 'State plainly that the task cannot be completed now, then list the specific missing tool or access needed from the grounded result.'
         : source === 'task_loop'
           ? 'Summarize the verified worker steps and final outcome plainly. Do not claim anything beyond the grounded result.'
-        : source === 'openhands'
-          ? 'Do not imply the delegated task is completed unless the grounded result explicitly says it is completed. If the grounded result only says the task was accepted or started, say only that.'
         : source === 'terminal'
           ? 'Include the verified command, exit code, and any stdout or stderr present in the grounded result. Do not omit the command result.'
         : source === 'read'
@@ -771,7 +770,6 @@ export class ChatOrchestratorService {
   }
 
   async describeRuntimeCapabilities(): Promise<string> {
-    const openHands = await this.openHandsWorkerService.checkAvailable()
     const homeAssistant = await this.homeAssistantWorkerService.describeCapabilities()
     const hasHa = /Home Assistant worker capabilities:/i.test(homeAssistant)
 
@@ -783,14 +781,11 @@ export class ChatOrchestratorService {
       '- Read tools for files, directories, logs, containers, and disk usage inside allowed app paths',
       '- Edit tools for scoped file creation and text replacement inside allowed writable app paths',
       '- System tools for time, uptime, service status, and managed-service restarts',
-      `- OpenHands delegation for isolated execution tasks: ${openHands.available ? 'available' : 'unavailable'}`,
       'Current limits:',
       '- No direct host home-directory or Desktop access is available',
       '- No arbitrary host filesystem write access is available',
       '- Replies must stay grounded in worker results and stored memory',
       ...(hasHa ? ['', homeAssistant] : []),
-      '',
-      await this.openHandsWorkerService.describeCapabilities(),
       '',
       this.systemWorkerService.describeCapabilities(),
       '',

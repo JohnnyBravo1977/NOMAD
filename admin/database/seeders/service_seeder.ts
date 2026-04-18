@@ -160,43 +160,6 @@ export default class ServiceSeeder extends BaseSeeder {
       is_dependency_service: false,
       depends_on: null,
     },
-    {
-      service_name: SERVICE_NAMES.OPENHANDS,
-      friendly_name: 'OpenHands Agent',
-      powered_by: 'OpenHands',
-      display_order: 4,
-      description: 'Agentic coding and terminal runtime for complex multi-step software tasks',
-      icon: 'IconTerminal2',
-      container_image: 'openhands:latest',
-      source_repo: 'https://github.com/OpenHands/OpenHands',
-      container_command: null,
-      container_config: JSON.stringify({
-        Env: [
-          'AGENT_SERVER_IMAGE_REPOSITORY=ghcr.io/openhands/agent-server',
-          'AGENT_SERVER_IMAGE_TAG=1.15.0-python',
-          `WORKSPACE_BASE=${ServiceSeeder.NOMAD_STORAGE_ABS_PATH}/openhands-workspace`,
-          `WORKSPACE_MOUNT_PATH=${ServiceSeeder.NOMAD_STORAGE_ABS_PATH}/openhands-workspace`,
-        ],
-        HostConfig: {
-          RestartPolicy: { Name: 'unless-stopped' },
-          PortBindings: { '3000/tcp': [{ HostPort: '3001' }] },
-          Binds: [
-            '/var/run/docker.sock:/var/run/docker.sock',
-            `${ServiceSeeder.NOMAD_STORAGE_ABS_PATH}/openhands:/.openhands`,
-            `${ServiceSeeder.NOMAD_STORAGE_ABS_PATH}/openhands-workspace:/workspace-base`,
-          ],
-          ExtraHosts: ['host.docker.internal:host-gateway'],
-        },
-        ExposedPorts: { '3000/tcp': {} },
-        OpenStdin: true,
-        Tty: true,
-      }),
-      ui_location: '3001',
-      installed: false,
-      installation_status: 'idle',
-      is_dependency_service: false,
-      depends_on: null,
-    },
   ]
 
   async run() {
