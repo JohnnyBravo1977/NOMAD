@@ -7,6 +7,7 @@ export type CrewAIWorkerFlowName =
   | 'restart_and_verify_service'
   | 'inspect_logs_config_and_files'
   | 'diagnose_home_assistant'
+  | 'repair_service_from_logs'
 
 type CrewAIRunPayload =
   | { tool: 'diagnose_container'; input: { container_name: string } }
@@ -25,6 +26,10 @@ type CrewAIRunPayload =
   | {
       tool: 'diagnose_home_assistant'
       input: Record<string, never>
+    }
+  | {
+      tool: 'repair_service_from_logs'
+      input: { service_name: string }
     }
 
 @inject()
@@ -53,7 +58,7 @@ export class CrewAIWorkerService {
       `- Status: ${available ? 'available' : 'unavailable'}`,
       `- URL: ${this.baseUrl}`,
       '- Purpose: bounded multi-step worker-flow execution only',
-      '- Current tools: diagnose_container, patch_file_and_verify, restart_and_verify_service, inspect_logs_config_and_files, diagnose_home_assistant',
+      '- Current tools: diagnose_container, patch_file_and_verify, restart_and_verify_service, inspect_logs_config_and_files, diagnose_home_assistant, repair_service_from_logs',
     ].join('\n')
   }
 

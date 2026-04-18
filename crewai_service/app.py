@@ -90,6 +90,14 @@ class DiagnoseHomeAssistantInput(BaseModel):
     pass
 
 
+class RepairServiceFromLogsInput(BaseModel):
+    service_name: str = Field(
+        ...,
+        description="Managed service/container name to inspect, restart, and verify",
+        validation_alias=AliasChoices("service_name", "service"),
+    )
+
+
 def get_docker() -> docker.DockerClient:
     return docker.from_env()
 
@@ -372,6 +380,19 @@ def render_diagnose_home_assistant_result(steps: list[tuple[str, str]]) -> str:
     )
 
 
+def render_repair_service_from_logs_result(service_name: str, steps: list[tuple[str, str]]) -> str:
+    evidence = "\n\n".join(format_section(title, result) for title, result in steps)
+    return "\n".join(
+        [
+            f"I ran the repair_service_from_logs flow for {service_name}.",
+            "I inspected the current service state and recent logs, then performed the safest bounded recovery step available: restart and verify.",
+            "",
+            "Grounded evidence:",
+            evidence,
+        ]
+    )
+
+
 def run_diagnose_container(payload: DiagnoseContainerInput) -> str:
     steps = [
         ("Step 1 — container inspection", InspectContainerTool()._run(payload.container_name)),
@@ -451,6 +472,17 @@ def run_diagnose_home_assistant(_payload: DiagnoseHomeAssistantInput) -> str:
     return render_diagnose_home_assistant_result(steps)
 
 
+def run_repair_service_from_logs(payload: RepairServiceFromLogsInput) -> str:
+    steps = [
+        ("Step 1 — container inspection", InspectContainerTool()._run(payload.service_name)),
+        ("Step 2 — recent logs", ContainerLogsTool()._run(payload.service_name)),
+        ("Step 3 — restart result", RestartServiceTool()._run(payload.service_name)),
+        ("Step 4 — verification status", ServiceStatusTool()._run(payload.service_name)),
+    ]
+
+    return render_repair_service_from_logs_result(payload.service_name, steps)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -486,6 +518,9 @@ def execute_job(job_id: str, request_payload: dict):
         elif request.tool == "diagnose_home_assistant":
             payload = DiagnoseHomeAssistantInput.model_validate(request.input)
             result = run_diagnose_home_assistant(payload)
+        elif request.tool == "repair_service_from_logs":
+            payload = RepairServiceFromLogsInput.model_validate(request.input)
+            result = run_repair_service_from_logs(payload)
         else:
             raise ValueError(f"Unsupported worker-flow tool: {request.tool}")
         write_job(
@@ -520,6 +555,7 @@ def run_worker_flow(request: RunRequest):
         "restart_and_verify_service",
         "inspect_logs_config_and_files",
         "diagnose_home_assistant",
+        "repair_service_from_logs",
     }:
         raise HTTPException(status_code=400, detail=f"Unsupported worker-flow tool: {request.tool}")
 

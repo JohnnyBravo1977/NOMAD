@@ -7,6 +7,7 @@ export type WorkerFlowToolName =
   | 'restart_and_verify_service'
   | 'inspect_logs_config_and_files'
   | 'diagnose_home_assistant'
+  | 'repair_service_from_logs'
 
 type WorkerFlowMatch =
   | { tool: 'diagnose_container'; containerName: string }
@@ -14,6 +15,7 @@ type WorkerFlowMatch =
   | { tool: 'restart_and_verify_service'; serviceName: string }
   | { tool: 'inspect_logs_config_and_files'; containerName: string }
   | { tool: 'diagnose_home_assistant' }
+  | { tool: 'repair_service_from_logs'; serviceName: string }
 
 @inject()
 export class WorkerFlowRegistryService {
@@ -28,6 +30,7 @@ export class WorkerFlowRegistryService {
       '- restart_and_verify_service',
       '- inspect_logs_config_and_files',
       '- diagnose_home_assistant',
+      '- repair_service_from_logs',
       'Worker-flow tool model:',
       '- A worker-flow tool runs a bounded multi-step job using sub-tools, then returns one grounded result.',
       '- This is the execution lane where CrewAI lives without affecting direct tools.',
@@ -103,6 +106,16 @@ export class WorkerFlowRegistryService {
             input: {},
           }),
         }
+      case 'repair_service_from_logs':
+        return {
+          tool: match.tool,
+          result: await this.crewAIWorkerService.runTool({
+            tool: 'repair_service_from_logs',
+            input: {
+              service_name: match.serviceName,
+            },
+          }),
+        }
       default:
         return null
     }
@@ -159,6 +172,16 @@ export class WorkerFlowRegistryService {
       /\bdiagnose_home_assistant\b/i.test(text)
     ) {
       return { tool: 'diagnose_home_assistant' }
+    }
+
+    match =
+      text.match(/\b(?:repair|fix|recover)\s+(?:the\s+)?service\s+([a-zA-Z0-9._-]+)\s+from\s+logs\b/i) ||
+      text.match(/\brepair_service_from_logs\s+([a-zA-Z0-9._-]+)/i)
+    if (match) {
+      return {
+        tool: 'repair_service_from_logs',
+        serviceName: match[1],
+      }
     }
 
     return null
