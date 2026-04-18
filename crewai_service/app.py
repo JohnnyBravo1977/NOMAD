@@ -310,14 +310,41 @@ def format_section(title: str, body: str) -> str:
     return f"{title}:\n{cleaned}"
 
 
+def find_first_signal(*texts: str) -> Optional[str]:
+    patterns = (
+        r"^.*\bERROR\b.*$",
+        r"^.*\bWARN(?:ING)?\b.*$",
+        r"^.*Missing required permissions.*$",
+        r"^.*couldn't find.*$",
+        r"^.*status:\s+[a-z]+.*$",
+    )
+    lines = []
+    for text in texts:
+        lines.extend(line.strip() for line in text.splitlines())
+
+    for pattern in patterns:
+        for stripped in lines:
+            if not stripped:
+                continue
+                if re.search(pattern, stripped, re.IGNORECASE):
+                    return stripped
+    return None
+
+
 def render_diagnose_container_result(container_name: str, steps: list[tuple[str, str]]) -> str:
     evidence = "\n\n".join(format_section(title, result) for title, result in steps)
+    signal = find_first_signal(*(result for _, result in steps))
+    intro = [
+        f"I checked the {container_name} container.",
+        "I looked at the container details, the recent logs, and the available config structure.",
+    ]
+    if signal:
+        intro.append(f"The main thing that stands out is: {signal}")
     return "\n".join(
         [
-            f"I diagnosed the {container_name} container.",
-            "I inspected the container itself, checked recent logs, and gathered the relevant config structure.",
+            " ".join(intro),
             "",
-            "Grounded evidence:",
+            "What I found:",
             evidence,
         ]
     )
@@ -327,17 +354,17 @@ def render_patch_file_and_verify_result(file_path: str, steps: list[tuple[str, s
     patch_result = next((result for title, result in steps if title == "Step 2 — patch result"), "")
     if "couldn't find" in patch_result:
         intro = (
-            f"I ran the patch_file_and_verify flow for {file_path}, but there was nothing to replace with the text you gave me."
+            f"I checked {file_path}, but there was nothing to replace with the text you gave me."
         )
     else:
-        intro = f"I ran the patch_file_and_verify flow for {file_path}."
+        intro = f"I updated {file_path} and verified the result."
 
     evidence = "\n\n".join(format_section(title, result) for title, result in steps)
     return "\n".join(
         [
             intro,
             "",
-            "Grounded evidence:",
+            "What I found:",
             evidence,
         ]
     )
@@ -345,11 +372,17 @@ def render_patch_file_and_verify_result(file_path: str, steps: list[tuple[str, s
 
 def render_restart_and_verify_service_result(service_name: str, steps: list[tuple[str, str]]) -> str:
     evidence = "\n\n".join(format_section(title, result) for title, result in steps)
+    verification = next((result for title, result in steps if title == "Step 2 — verification status"), "")
+    intro = (
+        f"I restarted {service_name} and it came back running."
+        if "running" in verification.lower()
+        else f"I restarted {service_name} and checked its status afterward."
+    )
     return "\n".join(
         [
-            f"I ran the restart_and_verify_service flow for {service_name}.",
+            intro,
             "",
-            "Grounded evidence:",
+            "What I found:",
             evidence,
         ]
     )
@@ -357,11 +390,15 @@ def render_restart_and_verify_service_result(service_name: str, steps: list[tupl
 
 def render_inspect_logs_config_and_files_result(container_name: str, steps: list[tuple[str, str]]) -> str:
     evidence = "\n\n".join(format_section(title, result) for title, result in steps)
+    signal = find_first_signal(*(result for _, result in steps))
+    intro = [f"I inspected {container_name}.", "I checked the recent logs, the config, and the file structure."]
+    if signal:
+        intro.append(f"The main thing that stands out is: {signal}")
     return "\n".join(
         [
-            f"I inspected logs, config, and file structure for {container_name}.",
+            " ".join(intro),
             "",
-            "Grounded evidence:",
+            "What I found:",
             evidence,
         ]
     )
@@ -369,12 +406,18 @@ def render_inspect_logs_config_and_files_result(container_name: str, steps: list
 
 def render_diagnose_home_assistant_result(steps: list[tuple[str, str]]) -> str:
     evidence = "\n\n".join(format_section(title, result) for title, result in steps)
+    signal = find_first_signal(*(result for _, result in steps))
+    intro = [
+        "I checked the Home Assistant setup.",
+        "I looked at the container, the recent logs, and the current /config structure.",
+    ]
+    if signal:
+        intro.append(f"The main thing that stands out is: {signal}")
     return "\n".join(
         [
-            "I diagnosed the Home Assistant setup.",
-            "I checked the container, recent logs, and the current /config structure.",
+            " ".join(intro),
             "",
-            "Grounded evidence:",
+            "What I found:",
             evidence,
         ]
     )
@@ -382,12 +425,18 @@ def render_diagnose_home_assistant_result(steps: list[tuple[str, str]]) -> str:
 
 def render_repair_service_from_logs_result(service_name: str, steps: list[tuple[str, str]]) -> str:
     evidence = "\n\n".join(format_section(title, result) for title, result in steps)
+    signal = find_first_signal(*(result for _, result in steps))
+    intro = [
+        f"I tried the safest bounded repair step I have for {service_name}.",
+        "I checked the current service state and recent logs, then restarted it and verified the result.",
+    ]
+    if signal:
+        intro.append(f"The main thing that stood out before the restart was: {signal}")
     return "\n".join(
         [
-            f"I ran the repair_service_from_logs flow for {service_name}.",
-            "I inspected the current service state and recent logs, then performed the safest bounded recovery step available: restart and verify.",
+            " ".join(intro),
             "",
-            "Grounded evidence:",
+            "What I found:",
             evidence,
         ]
     )
