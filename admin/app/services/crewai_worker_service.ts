@@ -4,12 +4,17 @@ import { spawn } from 'node:child_process'
 export type CrewAIWorkerFlowName =
   | 'diagnose_container'
   | 'patch_file_and_verify'
+  | 'restart_and_verify_service'
 
 type CrewAIRunPayload =
   | { tool: 'diagnose_container'; input: { container_name: string } }
   | {
       tool: 'patch_file_and_verify'
       input: { file_path: string; search: string; replace: string; service_name?: string }
+    }
+  | {
+      tool: 'restart_and_verify_service'
+      input: { service_name: string }
     }
 
 @inject()
@@ -38,7 +43,7 @@ export class CrewAIWorkerService {
       `- Status: ${available ? 'available' : 'unavailable'}`,
       `- URL: ${this.baseUrl}`,
       '- Purpose: bounded multi-step worker-flow execution only',
-      '- Current tools: diagnose_container, patch_file_and_verify',
+      '- Current tools: diagnose_container, patch_file_and_verify, restart_and_verify_service',
     ].join('\n')
   }
 

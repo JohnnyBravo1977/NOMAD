@@ -70,6 +70,14 @@ class PatchFileAndVerifyInput(BaseModel):
     )
 
 
+class RestartAndVerifyServiceInput(BaseModel):
+    service_name: str = Field(
+        ...,
+        description="Managed service/container name to restart and verify",
+        validation_alias=AliasChoices("service_name", "service"),
+    )
+
+
 def get_docker() -> docker.DockerClient:
     return docker.from_env()
 
@@ -315,6 +323,18 @@ def render_patch_file_and_verify_result(file_path: str, steps: list[tuple[str, s
     )
 
 
+def render_restart_and_verify_service_result(service_name: str, steps: list[tuple[str, str]]) -> str:
+    evidence = "\n\n".join(format_section(title, result) for title, result in steps)
+    return "\n".join(
+        [
+            f"I ran the restart_and_verify_service flow for {service_name}.",
+            "",
+            "Grounded evidence:",
+            evidence,
+        ]
+    )
+
+
 def run_diagnose_container(payload: DiagnoseContainerInput) -> str:
     steps = [
         ("Step 1 — container inspection", InspectContainerTool()._run(payload.container_name)),
@@ -358,6 +378,15 @@ def run_patch_file_and_verify(payload: PatchFileAndVerifyInput) -> str:
     return render_patch_file_and_verify_result(payload.file_path, steps)
 
 
+def run_restart_and_verify_service(payload: RestartAndVerifyServiceInput) -> str:
+    steps = [
+        ("Step 1 — restart result", RestartServiceTool()._run(payload.service_name)),
+        ("Step 2 — verification status", ServiceStatusTool()._run(payload.service_name)),
+    ]
+
+    return render_restart_and_verify_service_result(payload.service_name, steps)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -384,6 +413,9 @@ def execute_job(job_id: str, request_payload: dict):
         elif request.tool == "patch_file_and_verify":
             payload = PatchFileAndVerifyInput.model_validate(request.input)
             result = run_patch_file_and_verify(payload)
+        elif request.tool == "restart_and_verify_service":
+            payload = RestartAndVerifyServiceInput.model_validate(request.input)
+            result = run_restart_and_verify_service(payload)
         else:
             raise ValueError(f"Unsupported worker-flow tool: {request.tool}")
         write_job(
@@ -412,7 +444,7 @@ def execute_job(job_id: str, request_payload: dict):
 
 @app.post("/run")
 def run_worker_flow(request: RunRequest):
-    if request.tool not in {"diagnose_container", "patch_file_and_verify"}:
+    if request.tool not in {"diagnose_container", "patch_file_and_verify", "restart_and_verify_service"}:
         raise HTTPException(status_code=400, detail=f"Unsupported worker-flow tool: {request.tool}")
 
     job_id = uuid4().hex

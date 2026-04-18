@@ -4,10 +4,12 @@ import { CrewAIWorkerService } from '#services/crewai_worker_service'
 export type WorkerFlowToolName =
   | 'diagnose_container'
   | 'patch_file_and_verify'
+  | 'restart_and_verify_service'
 
 type WorkerFlowMatch =
   | { tool: 'diagnose_container'; containerName: string }
   | { tool: 'patch_file_and_verify'; filePath: string; search: string; replace: string; serviceName?: string }
+  | { tool: 'restart_and_verify_service'; serviceName: string }
 
 @inject()
 export class WorkerFlowRegistryService {
@@ -19,6 +21,7 @@ export class WorkerFlowRegistryService {
       'Worker-flow tools:',
       '- diagnose_container',
       '- patch_file_and_verify',
+      '- restart_and_verify_service',
       'Worker-flow tool model:',
       '- A worker-flow tool runs a bounded multi-step job using sub-tools, then returns one grounded result.',
       '- This is the execution lane where CrewAI lives without affecting direct tools.',
@@ -66,6 +69,16 @@ export class WorkerFlowRegistryService {
             },
           }),
         }
+      case 'restart_and_verify_service':
+        return {
+          tool: match.tool,
+          result: await this.crewAIWorkerService.runTool({
+            tool: 'restart_and_verify_service',
+            input: {
+              service_name: match.serviceName,
+            },
+          }),
+        }
       default:
         return null
     }
@@ -92,6 +105,17 @@ export class WorkerFlowRegistryService {
         search: match[2],
         replace: match[3],
         serviceName: match[4] || undefined,
+      }
+    }
+
+    match =
+      text.match(/\b(?:restart|bounce|reboot)\s+(?:the\s+)?service\s+([a-zA-Z0-9._-]+)(?:\s+and\s+verify)?/i) ||
+      text.match(/\brestart_and_verify_service\s+([a-zA-Z0-9._-]+)/i) ||
+      text.match(/\brestart\s+([a-zA-Z0-9._-]+)\s+and\s+verify\b/i)
+    if (match) {
+      return {
+        tool: 'restart_and_verify_service',
+        serviceName: match[1],
       }
     }
 
