@@ -644,6 +644,17 @@ export class ChatOrchestratorService {
     const { lastUserText, model, messages, profiles, activeUser, userName, ragService } = args
     const groundedText = resolveGroundedFollowUpText(lastUserText, messages)
 
+    if (isHostDesktopWriteQuestion(groundedText)) {
+      return this.createGroundedContextMessage(
+        'missing_capability',
+        groundedText,
+        [
+          `I can't write to your Desktop right now.`,
+          `The host Desktop action bridge is not available, and I do not have direct host home-directory write access.`,
+        ].join('\n')
+      )
+    }
+
     if (isCapabilityQuestion(groundedText)) {
       return this.createGroundedContextMessage(
         'capabilities',
@@ -737,6 +748,7 @@ export class ChatOrchestratorService {
       source === 'terminal' ||
       source === 'direct_tool' ||
       source === 'worker_flow' ||
+      source === 'home_assistant' ||
       source === 'missing_capability' ||
       source === 'error'
         ? result
@@ -788,33 +800,18 @@ export class ChatOrchestratorService {
   }
 
   async describeRuntimeCapabilities(): Promise<string> {
-    const homeAssistant = await this.homeAssistantWorkerService.describeCapabilities()
-    const hasHa = /Home Assistant worker capabilities:/i.test(homeAssistant)
-
     return [
-      'Live capability summary:',
-      '- Chat and memory responses',
-      '- Offline RAG/library lookups when relevant context is available',
-      '- Home Assistant control and status tools',
-      '- Direct deterministic tools',
-      '- Worker-flow tools for bounded multi-step jobs',
-      'Current limits:',
-      '- No direct host home-directory or Desktop access is available',
-      '- No arbitrary host filesystem write access is available',
-      '- Replies must stay grounded in worker results and stored memory',
-      '',
-      this.directToolRegistryService.describeTools(),
-      '',
-      await this.workerFlowRegistryService.describeTools(),
-      ...(hasHa ? ['', homeAssistant] : []),
-      '',
-      this.systemWorkerService.describeCapabilities(),
-      '',
-      this.terminalWorkerService.describeCapabilities(),
-      '',
-      this.readWorkerService.describeCapabilities(),
-      '',
-      this.editWorkerService.describeCapabilities(),
+      `Right now I can help in a few clear lanes:`,
+      `- Home Assistant status and control`,
+      `- Direct tools: list_containers, inspect_docker_container, inspect_files, read_files, write_file, edit_file, create_shortcut, run_safe_command`,
+      `- Worker-flow tools: diagnose_container, patch_file_and_verify, restart_and_verify_service, inspect_logs_config_and_files, diagnose_home_assistant, repair_service_from_logs`,
+      `- Chat, memory, and offline library lookups when they are relevant`,
+      ``,
+      `Important limits:`,
+      `- I can read under /app and /tmp, and I can write under /app/storage and /tmp.`,
+      `- run_safe_command stays inside the nomad_admin runtime and blocks destructive system-admin commands.`,
+      `- I do not have host Desktop or home-directory write access right now, so create_shortcut stays disabled until we add a narrow host bridge.`,
+      `- My replies are supposed to stay grounded in tool results and stored memory.`,
     ].join('\n')
   }
 
@@ -1960,6 +1957,16 @@ function isDesktopShortcutRequest(text: string): boolean {
   if (!cleaned) return false
   if (!/\b(shortcut|launcher)\b/.test(cleaned)) return false
   return /\b(create|make|add|put)\b/.test(cleaned)
+}
+
+function isHostDesktopWriteQuestion(text: string): boolean {
+  const cleaned = text.trim().toLowerCase()
+  if (!cleaned) return false
+  return (
+    /\b(can you|are you able to|do you have access to)\b/.test(cleaned) &&
+    /\b(write|create|save|put)\b/.test(cleaned) &&
+    /\b(desktop|home directory|home folder)\b/.test(cleaned)
+  )
 }
 
 function normalizeAutonomousWorker(value: string): string {

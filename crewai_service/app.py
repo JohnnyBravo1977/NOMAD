@@ -372,12 +372,14 @@ def render_patch_file_and_verify_result(file_path: str, steps: list[tuple[str, s
 
 def render_restart_and_verify_service_result(service_name: str, steps: list[tuple[str, str]]) -> str:
     evidence = "\n\n".join(format_section(title, result) for title, result in steps)
+    restart_result = next((result for title, result in steps if title == "Step 1 — restart result"), "")
     verification = next((result for title, result in steps if title == "Step 2 — verification status"), "")
-    intro = (
-        f"I restarted {service_name} and it came back running."
-        if "running" in verification.lower()
-        else f"I restarted {service_name} and checked its status afterward."
-    )
+    if "couldn't find a managed service" in restart_result.lower():
+        intro = f"I couldn't restart {service_name} because I couldn't find that managed service."
+    elif "running" in verification.lower():
+        intro = f"I restarted {service_name} and it came back running."
+    else:
+        intro = f"I restarted {service_name} and checked its status afterward."
     return "\n".join(
         [
             intro,
@@ -426,10 +428,17 @@ def render_diagnose_home_assistant_result(steps: list[tuple[str, str]]) -> str:
 def render_repair_service_from_logs_result(service_name: str, steps: list[tuple[str, str]]) -> str:
     evidence = "\n\n".join(format_section(title, result) for title, result in steps)
     signal = find_first_signal(*(result for _, result in steps))
+    restart_result = next((result for title, result in steps if title == "Step 3 — restart result"), "")
+    verification = next((result for title, result in steps if title == "Step 4 — verification status"), "")
     intro = [
         f"I tried the safest bounded repair step I have for {service_name}.",
-        "I checked the current service state and recent logs, then restarted it and verified the result.",
     ]
+    if "couldn't find a managed service" in restart_result.lower():
+        intro.append("I could inspect the request, but I could not find that managed service to restart it.")
+    elif "running" in verification.lower():
+        intro.append("I checked the current service state and recent logs, then restarted it and verified that it came back running.")
+    else:
+        intro.append("I checked the current service state and recent logs, then restarted it and verified the result.")
     if signal:
         intro.append(f"The main thing that stood out before the restart was: {signal}")
     return "\n".join(

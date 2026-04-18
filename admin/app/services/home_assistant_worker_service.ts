@@ -302,10 +302,9 @@ export class HomeAssistantWorkerService {
 
     const state = await this.homeAssistantService.getState(entityId)
     if (!state) {
-      return `Home Assistant service ${domain}.${service} completed for ${entityId}.`
+      return `I completed ${domain}.${service} for ${entityId}.`
     }
-
-    return `Home Assistant service ${domain}.${service} completed.\n${this.describeState(state)}`
+    return this.describeServiceOutcome(domain, service, [state])
   }
 
   private async callGroupService(
@@ -331,9 +330,11 @@ export class HomeAssistantWorkerService {
     await this.homeAssistantService.callService(domain, service, { entity_id: entityIds })
 
     const states = await Promise.all(entityIds.map((entityId) => this.homeAssistantService.getState(entityId)))
-    const descriptions = states.filter(Boolean).map((state) => this.describeState(state!))
-
-    return `Home Assistant service ${domain}.${service} completed for ${entityIds.length} entr${entityIds.length === 1 ? 'y' : 'ies'}.\n${descriptions.join('\n\n')}`
+    return this.describeServiceOutcome(
+      domain,
+      service,
+      states.filter((state): state is HaState => Boolean(state))
+    )
   }
 
   private async getHouseSummary(): Promise<string> {
@@ -359,6 +360,38 @@ export class HomeAssistantWorkerService {
     }
 
     return `House status summary:\n${lines.join('\n\n')}`
+  }
+
+  private describeServiceOutcome(domain: string, service: string, states: HaState[]): string {
+    const descriptions = states.map((state) => this.describeState(state))
+    const summary = this.describeActionSummary(domain, service, states)
+    return descriptions.length > 0 ? `${summary}\n\n${descriptions.join('\n\n')}` : summary
+  }
+
+  private describeActionSummary(domain: string, service: string, states: HaState[]): string {
+    const count = states.length
+    if (domain === 'lock' && service === 'lock') {
+      return count === 1 ? `I locked ${this.formatFriendlyName(states[0])}.` : `I locked ${count} doors.`
+    }
+    if (domain === 'lock' && service === 'unlock') {
+      return count === 1 ? `I unlocked ${this.formatFriendlyName(states[0])}.` : `I unlocked ${count} doors.`
+    }
+    if ((domain === 'homeassistant' || domain === 'light' || domain === 'switch' || domain === 'input_boolean') && service === 'turn_off') {
+      return count === 1 ? `I turned off ${this.formatFriendlyName(states[0])}.` : `I turned off ${count} items.`
+    }
+    if ((domain === 'homeassistant' || domain === 'light' || domain === 'switch' || domain === 'input_boolean') && service === 'turn_on') {
+      return count === 1 ? `I turned on ${this.formatFriendlyName(states[0])}.` : `I turned on ${count} items.`
+    }
+    if (domain === 'input_number' && service === 'set_value' && states[0]) {
+      return `I set ${this.formatFriendlyName(states[0])} to ${states[0].state}.`
+    }
+    if (domain === 'input_select' && service === 'select_option' && states[0]) {
+      return `I set ${this.formatFriendlyName(states[0])} to ${states[0].state}.`
+    }
+    if (domain === 'todo' && service === 'add_item') {
+      return 'I added that to the shopping list.'
+    }
+    return `I completed ${domain}.${service}.`
   }
 
   private async getHouseAttentionSummary(): Promise<string> {
@@ -459,6 +492,14 @@ export class HomeAssistantWorkerService {
       parts.push(`current_temperature=${state.attributes.current_temperature}`)
     }
     return parts.join('\n')
+  }
+
+  private formatFriendlyName(state?: HaState | null): string {
+    if (!state) return 'it'
+    const friendlyName = state.attributes?.friendly_name
+    return typeof friendlyName === 'string' && friendlyName.trim().length > 0
+      ? friendlyName
+      : state.entity_id
   }
 
   private cleanEntityReference(value: string): string {

@@ -159,13 +159,36 @@ export class DirectToolRegistryService {
   }
 
   private createShortcutCapabilityMessage(targetName: string): string {
+    const normalizedTargetName = this.normalizeShortcutTargetName(targetName)
+
     return [
-      `Missing capability: create_shortcut is defined for ${targetName}, but verified host Desktop shortcut creation is disabled right now.`,
+      normalizedTargetName
+        ? `Missing capability: create_shortcut is defined for ${normalizedTargetName}, but verified host Desktop shortcut creation is disabled right now.`
+        : 'Missing capability: create_shortcut is available in principle, but verified host Desktop shortcut creation is disabled right now.',
       'Current status:',
       '- No host Desktop action bridge is available.',
       '- No direct host home-directory write access is available.',
       '- To enable this tool safely, we need a narrow host shortcut bridge instead of broad host writes.',
     ].join('\n')
+  }
+
+  private normalizeShortcutTargetName(value: string): string {
+    const normalized = value
+      .trim()
+      .replace(/\s+(?:please|for me)$/i, '')
+      .replace(/^(?:on|in)\s+ubuntu$/i, '')
+      .replace(/\s+(?:on|in)\s+ubuntu$/i, '')
+      .replace(/^(?:on|to)\s+the\s+desktop$/i, '')
+      .replace(/\s+(?:on|to)\s+the\s+desktop$/i, '')
+      .replace(/\s+and\s+put\s+it\s+on\s+the\s+desktop$/i, '')
+      .replace(/\s+and\s+add\s+it\s+to\s+the\s+desktop$/i, '')
+      .trim()
+
+    if (!normalized || /^(ubuntu|desktop|the desktop)$/i.test(normalized)) {
+      return ''
+    }
+
+    return normalized
   }
 }
 

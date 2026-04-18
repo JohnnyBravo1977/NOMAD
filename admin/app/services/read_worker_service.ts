@@ -253,39 +253,47 @@ export class ReadWorkerService {
   }
 
   async readTextFile(filePath: string): Promise<string> {
-    const resolvedPath = this.resolveAllowedPath(filePath)
-    const fileInfo = await stat(resolvedPath)
-    if (!fileInfo.isFile()) {
-      return `${filePath} is not a file.`
-    }
+    try {
+      const resolvedPath = this.resolveAllowedPath(filePath)
+      const fileInfo = await stat(resolvedPath)
+      if (!fileInfo.isFile()) {
+        return `${filePath} is not a file.`
+      }
 
-    const content = await readFile(resolvedPath, 'utf-8')
-    const isTruncated = content.length > MAX_FILE_BYTES
-    const trimmed = isTruncated ? `${content.slice(0, MAX_FILE_BYTES)}\n...[truncated]` : content
-    return isTruncated
-      ? `I opened ${resolvedPath}. The file is large, so here is the beginning of it:\n${trimmed}`
-      : `I opened ${resolvedPath}. Here is the current file content:\n${trimmed}`
+      const content = await readFile(resolvedPath, 'utf-8')
+      const isTruncated = content.length > MAX_FILE_BYTES
+      const trimmed = isTruncated ? `${content.slice(0, MAX_FILE_BYTES)}\n...[truncated]` : content
+      return isTruncated
+        ? `I opened ${resolvedPath}. The file is large, so here is the beginning of it:\n${trimmed}`
+        : `I opened ${resolvedPath}. Here is the current file content:\n${trimmed}`
+    } catch (error) {
+      return await this.describePathError(filePath, error)
+    }
   }
 
   async listDirectory(dirPath: string): Promise<string> {
-    const resolvedPath = this.resolveAllowedPath(dirPath)
-    const dirInfo = await stat(resolvedPath)
-    if (!dirInfo.isDirectory()) {
-      return `${dirPath} is not a directory.`
+    try {
+      const resolvedPath = this.resolveAllowedPath(dirPath)
+      const dirInfo = await stat(resolvedPath)
+      if (!dirInfo.isDirectory()) {
+        return `${dirPath} is not a directory.`
+      }
+
+      const entries = await readdir(resolvedPath, { withFileTypes: true })
+      const sortedEntries = entries
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .slice(0, 50)
+      const directories = sortedEntries.filter((entry) => entry.isDirectory()).map((entry) => entry.name)
+      const files = sortedEntries.filter((entry) => !entry.isDirectory()).map((entry) => entry.name)
+
+      const lines = [this.describeDirectorySummary(resolvedPath, directories, files, sortedEntries.length)]
+
+      return sortedEntries.length > 0
+        ? lines.join('\n')
+        : `${resolvedPath} is empty.`
+    } catch (error) {
+      return await this.describePathError(dirPath, error)
     }
-
-    const entries = await readdir(resolvedPath, { withFileTypes: true })
-    const sortedEntries = entries
-      .sort((a, b) => a.name.localeCompare(b.name))
-      .slice(0, 50)
-    const directories = sortedEntries.filter((entry) => entry.isDirectory()).map((entry) => entry.name)
-    const files = sortedEntries.filter((entry) => !entry.isDirectory()).map((entry) => entry.name)
-
-    const lines = [this.describeDirectorySummary(resolvedPath, directories, files, sortedEntries.length)]
-
-    return sortedEntries.length > 0
-      ? lines.join('\n')
-      : `${resolvedPath} is empty.`
   }
 
   private describeDirectorySummary(
@@ -348,15 +356,19 @@ export class ReadWorkerService {
   }
 
   async inspectPath(targetPath: string): Promise<string> {
-    const resolvedPath = this.resolveAllowedPath(targetPath)
-    const entryInfo = await stat(resolvedPath)
-    if (entryInfo.isDirectory()) {
-      return this.listDirectory(targetPath)
+    try {
+      const resolvedPath = this.resolveAllowedPath(targetPath)
+      const entryInfo = await stat(resolvedPath)
+      if (entryInfo.isDirectory()) {
+        return this.listDirectory(targetPath)
+      }
+      if (entryInfo.isFile()) {
+        return this.readTextFile(targetPath)
+      }
+      return `${targetPath} is neither a regular file nor a directory.`
+    } catch (error) {
+      return await this.describePathError(targetPath, error)
     }
-    if (entryInfo.isFile()) {
-      return this.readTextFile(targetPath)
-    }
-    return `${targetPath} is neither a regular file nor a directory.`
   }
 
   async findFiles(query: string): Promise<string> {
@@ -472,6 +484,60 @@ export class ReadWorkerService {
       throw new Error(`Path ${requestedPath} is outside the allowed read roots.`)
     }
     return resolved
+  }
+
+  private async describePathError(requestedPath: string, error: unknown): Promise<string> {
+    if (error instanceof Error) {
+      if (/outside the allowed read roots/i.test(error.message)) {
+        return error.message
+      }
+
+      const nodeError = error as NodeJS.ErrnoException
+      if (nodeError.code === 'ENOENT') {
+        const suggestion = await this.findNearbyPathSuggestion(requestedPath)
+        if (suggestion) {
+          return `I couldn't find ${requestedPath}. The closest path I can see there is ${suggestion}.`
+        }
+        return `I couldn't find ${requestedPath}.`
+      }
+    }
+
+    return `I couldn't inspect ${requestedPath}.`
+  }
+
+  private async findNearbyPathSuggestion(requestedPath: string): Promise<string | null> {
+    const trimmed = requestedPath.trim()
+    const resolved = path.resolve(trimmed)
+    const allowed = ALLOWED_READ_ROOTS.some((root) => resolved === root || resolved.startsWith(`${root}/`))
+    if (!allowed) return null
+
+    const parentDir = path.dirname(resolved)
+    try {
+      const parentInfo = await stat(parentDir)
+      if (!parentInfo.isDirectory()) return null
+    } catch {
+      return null
+    }
+
+    try {
+      const entries = await readdir(parentDir, { withFileTypes: true })
+      const targetBase = path.basename(resolved)
+      const targetStem = targetBase.replace(/\.[^.]+$/u, '').toLowerCase()
+
+      const exactStemMatch = entries.find((entry) => entry.name.replace(/\.[^.]+$/u, '').toLowerCase() === targetStem)
+      if (exactStemMatch) {
+        return path.join(parentDir, exactStemMatch.name)
+      }
+
+      const partialMatch = entries.find((entry) => entry.name.toLowerCase().includes(targetStem))
+      if (partialMatch) {
+        return path.join(parentDir, partialMatch.name)
+      }
+    } catch {
+      return null
+    }
+
+    return null
   }
 
   private async walkFiles(
