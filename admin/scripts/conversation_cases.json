@@ -1,0 +1,305 @@
+{
+  "meta": {
+    "description": "Conversation/personality regression cases for /api/ollama/chat. These assert safety invariants (no meta-leak, no fake prior convo, no generic closers) and minimal intent correctness.",
+    "defaultModel": "qwen2.5:32b-instruct-q5_K_M"
+  },
+  "cases": [
+    {
+      "id": "status_check_basic",
+      "turns": ["how are you quinn"],
+      "expect": {
+        "mustNotMatch": [
+          "conversation segment",
+          "\\bintent\\b",
+          "\\bpayload\\b",
+          "\\brouting\\b",
+          "\\bschema\\b",
+          "previous conversation",
+          "don't hesitate",
+          "let me know if",
+          "anything else i can help",
+          "is there anything else",
+          "\\bshortcut\\b",
+          "\\bdesktop\\b"
+        ],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "critique_flatness_just_ok",
+      "turns": ["just ok"],
+      "expect": {
+        "mustNotMatch": [
+          "\\bshortcut\\b",
+          "\\bdesktop\\b",
+          "conversation segment",
+          "\\bintent\\b",
+          "\\bpayload\\b",
+          "\\brouting\\b",
+          "\\bschema\\b"
+        ],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "positive_ack_awesome",
+      "turns": ["awesome"],
+      "expect": {
+        "mustNotMatch": [
+          "\\bshortcut\\b",
+          "\\bdesktop\\b",
+          "conversation segment",
+          "\\bintent\\b",
+          "\\bpayload\\b",
+          "\\brouting\\b",
+          "\\bschema\\b"
+        ],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "relationship_statement_memory_write",
+      "turns": ["Ellie is my 11 year old daughter"],
+      "expect": {
+        "mustMatch": ["\\bellie\\b", "\\bdaughter\\b"],
+        "mustNotMatch": [
+          "\\bshortcut\\b",
+          "\\bdesktop\\b",
+          "conversation segment",
+          "\\bintent\\b",
+          "\\bpayload\\b",
+          "\\brouting\\b",
+          "\\bschema\\b"
+        ],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "relationship_after_shortcut_history",
+      "seed": [
+        { "role": "assistant", "content": "I created the Home Assistant shortcut on the Desktop." }
+      ],
+      "turns": ["Ellie is my 11 year old daughter"],
+      "expect": {
+        "mustMatch": ["\\bellie\\b", "\\bdaughter\\b"],
+        "mustNotMatch": [
+          "\\bshortcut\\b",
+          "\\bdesktop\\b",
+          "conversation segment",
+          "\\bintent\\b",
+          "\\bpayload\\b",
+          "\\brouting\\b",
+          "\\bschema\\b"
+        ],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "future_plan_excitement_chat",
+      "turns": ["Im excited about you managing the whole house automation", "Not right now. It's a future plan"],
+      "expect": {
+        "mustNotMatch": [
+          "I need a little more detail",
+          "What exactly should I do",
+          "\\bshortcut\\b",
+          "\\bdesktop\\b",
+          "conversation segment",
+          "\\bintent\\b",
+          "\\bpayload\\b",
+          "\\brouting\\b",
+          "\\bschema\\b",
+          "let me know when"
+        ],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "capabilities_discussion_chatty",
+      "turns": ["what do you think about all the stuff you can do now"],
+      "expect": {
+        "mustNotMatch": [
+          "^Here's what I can help with right now:",
+          "^Here is what I can use right now:",
+          "\\n-\\s+",
+          "\\bHermes\\b",
+          "\\blane\\b",
+          "\\bbridge\\b",
+          "\\blauncher\\b",
+          "host-user",
+          "conversation segment",
+          "\\bintent\\b",
+          "\\bpayload\\b",
+          "\\brouting\\b",
+          "\\bschema\\b",
+          "previous conversation",
+          "don't hesitate",
+          "let me know if",
+          "anything else i can help",
+          "is there anything else"
+        ],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "capabilities_discussion_engine_built",
+      "turns": [
+        "well i am running your model on my own engine and have built all the tools around you. i was more so talking about all the stuff you yourself can do now with all the information you have and the tools you can use"
+      ],
+      "expect": {
+        "mustNotMatch": [
+          "I need a little more detail",
+          "What exactly should I do",
+          "^Here's what I can help with right now:",
+          "^Here is what I can use right now:",
+          "\\n-\\s+",
+          "\\bHermes\\b",
+          "\\blane\\b",
+          "\\bbridge\\b",
+          "\\blauncher\\b",
+          "host-user",
+          "\\bconfirm\\b",
+          "you provided",
+          "conversation segment",
+          "\\bintent\\b",
+          "\\bpayload\\b",
+          "\\brouting\\b",
+          "\\bschema\\b",
+          "\\bshortcut\\b",
+          "\\bdesktop\\b",
+          "don't hesitate",
+          "let me know if",
+          "is there anything else"
+        ],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "critique_flatness_after_shortcut_history",
+      "seed": [
+        { "role": "assistant", "content": "I created the Home Assistant shortcut on the Desktop." }
+      ],
+      "turns": ["just ok"],
+      "expect": {
+        "mustNotMatch": [
+          "\\bi\\s+(?:created|removed|made|ran|executed|restarted|repaired|patched|inspected|checked|set|turned on|turned off|locked|unlocked)\\b[\\s\\S]{0,80}\\bshortcut\\b",
+          "conversation segment",
+          "\\bintent\\b",
+          "\\bpayload\\b",
+          "\\brouting\\b",
+          "\\bschema\\b"
+        ],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "assistant_identity",
+      "turns": ["whats your name"],
+      "expect": {
+        "mustMatch": ["\\bquinn\\b"],
+        "mustNotMatch": ["conversation segment", "\\bintent\\b", "\\bpayload\\b", "previous conversation"],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "reciprocal_status_no_robot_disclaimer",
+      "turns": ["im fine and you?"],
+      "expect": {
+        "mustNotMatch": [
+          "don't have feelings",
+          "do not have feelings",
+          "just a chat assistant",
+          "just an ai assistant",
+          "just a ai assistant"
+        ],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "named_person_family_phrasing",
+      "turns": ["who is ellie?"],
+      "expect": {
+        "mustMatch": ["your daughter"],
+        "mustNotMatch": ["Daughter of John", "^Here's what I know about", "\\n-\\s+"],
+        "mustStartWithOneOf": ["Ellie is your daughter."],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "capabilities_short_what_can_you_do",
+      "turns": ["what can you do"],
+      "expect": {
+        "mustNotMatch": [
+          "^Here's what I can help with right now:",
+          "^Here is what I can use right now:",
+          "Running services:",
+          "A few limits:",
+          "\\n-\\s+"
+        ],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "capabilities_short_tools_access",
+      "turns": ["what tools do you have access to"],
+      "expect": {
+        "mustNotMatch": [
+          "^Here's what I can help with right now:",
+          "^Here is what I can use right now:",
+          "Running services:",
+          "A few limits:",
+          "\\n-\\s+"
+        ],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "greeting",
+      "turns": ["hey quinn"],
+      "expect": {
+        "mustNotMatch": ["conversation segment", "\\bintent\\b", "\\bpayload\\b", "previous conversation", "don't hesitate"],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "gratitude",
+      "turns": ["thanks"],
+      "expect": {
+        "mustNotMatch": ["conversation segment", "\\bintent\\b", "\\bpayload\\b", "previous conversation", "anything else i can help"],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "reciprocal_status",
+      "turns": ["how are you quinn", "im fine and you?"],
+      "expect": {
+        "mustNotMatch": ["conversation segment", "\\bintent\\b", "\\bpayload\\b", "previous conversation", "don't hesitate"],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "frustration_ack",
+      "turns": ["for fucks sake"],
+      "expect": {
+        "mustNotMatch": ["conversation segment", "\\bintent\\b", "\\bpayload\\b", "previous conversation", "anything else i can help"],
+        "mustNotHaveEmoji": true
+      }
+    },
+    {
+      "id": "multiline_ack_bundle",
+      "turns": ["thanks\\nawesome\\njust ok"],
+      "expect": {
+        "mustNotMatch": [
+          "\\bshortcut\\b",
+          "\\bdesktop\\b",
+          "conversation segment",
+          "\\bintent\\b",
+          "\\bpayload\\b",
+          "\\brouting\\b",
+          "\\bschema\\b",
+          "previous conversation"
+        ],
+        "mustNotHaveEmoji": true
+      }
+    }
+  ]
+}

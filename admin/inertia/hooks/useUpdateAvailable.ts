@@ -3,10 +3,11 @@ import { CheckLatestVersionResult } from "../../types/system"
 import { useQuery } from "@tanstack/react-query"
 
 
-export const useUpdateAvailable = () => {
+export const useUpdateAvailable = (enabled: boolean = true) => {
     const queryData = useQuery<CheckLatestVersionResult | undefined>({
         queryKey: ['system-update-available'],
         queryFn: () => api.checkLatestVersion(),
+        enabled,
         refetchInterval: Infinity, // Disable automatic refetching
         refetchOnWindowFocus: false,
     })

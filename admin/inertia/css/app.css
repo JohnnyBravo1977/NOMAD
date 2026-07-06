@@ -56,6 +56,20 @@ body {
   transition: background-color 0.2s ease, color 0.2s ease;
 }
 
+html,
+body,
+#app {
+  width: 100%;
+  max-width: 100%;
+  min-height: 100dvh;
+  overflow-x: hidden;
+}
+
+html {
+  touch-action: manipulation;
+  -webkit-text-size-adjust: 100%;
+}
+
 /* Night Ops — warm charcoal dark mode */
 [data-theme="dark"] {
   /* Backgrounds: light sand → warm charcoal */

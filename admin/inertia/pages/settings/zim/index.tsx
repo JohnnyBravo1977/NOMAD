@@ -22,7 +22,7 @@ export default function ZimPage() {
 
   async function getFiles() {
     const res = await api.listZimFiles()
-    return res.data.files
+    return res?.files || []
   }
 
   async function confirmDeleteFile(file: ZimFileWithMetadata) {

@@ -1,5 +1,6 @@
 import KVStore from '#models/kv_store'
 import { BenchmarkService } from '#services/benchmark_service'
+import { ConversationGateService } from '#services/conversation_gate_service'
 import { MapService } from '#services/map_service'
 import { OllamaService } from '#services/ollama_service'
 import { SystemService } from '#services/system_service'
@@ -13,7 +14,8 @@ export default class SettingsController {
     private systemService: SystemService,
     private mapService: MapService,
     private benchmarkService: BenchmarkService,
-    private ollamaService: OllamaService
+    private ollamaService: OllamaService,
+    private conversationGateService: ConversationGateService
   ) {}
 
   async system({ inertia }: HttpContext) {
@@ -118,7 +120,95 @@ export default class SettingsController {
 
   async updateSetting({ request, response }: HttpContext) {
     const reqData = await request.validateUsing(updateSettingSchema)
+    const gatedKeys = new Set(['ai.systemPrompt', 'ai.assistantCustomName'])
+    const shouldGate = gatedKeys.has(reqData.key)
+
+    const previousValue = shouldGate ? await KVStore.getValue(reqData.key as any) : undefined
     await this.systemService.updateSetting(reqData.key, reqData.value)
+
+    if (shouldGate) {
+      if (reqData.key === 'ai.systemPrompt') {
+        void this.runBackgroundConversationGate(reqData.key, previousValue, reqData.value)
+        return response.status(200).send({
+          success: true,
+          message: 'Chat style saved. Background conversation check started.',
+          gatePending: true,
+        })
+      }
+
+      try {
+        const gate = await this.runConversationGateWithTimeout(reqData.key)
+
+        if (!gate.ok) {
+          // Roll back the setting to keep the runtime stable.
+          await this.systemService.updateSetting(reqData.key, previousValue)
+          return response.status(400).send({
+            success: false,
+            message: `Conversation/personality gate failed. Reverted ${reqData.key}.`,
+            gate,
+          })
+        }
+      } catch (error) {
+        await this.systemService.updateSetting(reqData.key, previousValue)
+        return response.status(500).send({
+          success: false,
+          message: `Conversation/personality gate errored. Reverted ${reqData.key}.`,
+          error: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+
     return response.status(200).send({ success: true, message: 'Setting updated successfully' })
+  }
+
+  private buildGateArgs(key: string) {
+    return key === 'ai.assistantCustomName'
+      ? {
+          modes: ['json' as const],
+          onlyCaseIds: ['assistant_identity', 'status_check_basic', 'greeting'],
+        }
+      : {
+          modes: ['json' as const],
+          onlyCaseIds: [
+            'status_check_basic',
+            'assistant_identity',
+            'greeting',
+            'gratitude',
+            'relationship_after_shortcut_history',
+            'critique_flatness_after_shortcut_history',
+            'future_plan_excitement_chat',
+          ],
+        }
+  }
+
+  private async runConversationGateWithTimeout(key: string) {
+    const gateTimeoutMs = key === 'ai.assistantCustomName' ? 90_000 : 150_000
+    return Promise.race([
+      this.conversationGateService.runConversationGate(this.buildGateArgs(key)),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`Conversation/personality gate timed out after ${gateTimeoutMs}ms.`)), gateTimeoutMs)
+      ),
+    ])
+  }
+
+  private async runBackgroundConversationGate(
+    key: string,
+    previousValue: any,
+    nextValue: any
+  ): Promise<void> {
+    try {
+      const gate = await this.runConversationGateWithTimeout(key)
+      if (gate.ok) return
+
+      const currentValue = await KVStore.getValue(key as any)
+      if (currentValue === nextValue) {
+        await this.systemService.updateSetting(key as any, previousValue)
+      }
+    } catch (error) {
+      const currentValue = await KVStore.getValue(key as any)
+      if (currentValue === nextValue) {
+        await this.systemService.updateSetting(key as any, previousValue)
+      }
+    }
   }
 }

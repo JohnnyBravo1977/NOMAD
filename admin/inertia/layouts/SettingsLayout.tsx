@@ -8,6 +8,7 @@ import {
   IconMapRoute,
   IconSettings,
   IconTerminal2,
+  IconUsers,
   IconWand,
   IconZoom
 } from '@tabler/icons-react'
@@ -42,6 +43,7 @@ export default function SettingsLayout({ children }: { children: React.ReactNode
       current: false,
     },
     { name: 'System', href: '/settings/system', icon: IconSettings, current: false },
+    { name: 'Users', href: '/settings/users', icon: IconUsers, current: false },
     { name: 'Support the Project', href: '/settings/support', icon: IconHeart, current: false },
     { name: 'Legal Notices', href: '/settings/legal', icon: IconGavel, current: false },
   ]
@@ -49,7 +51,7 @@ export default function SettingsLayout({ children }: { children: React.ReactNode
   return (
     <div className="min-h-screen flex flex-row bg-surface-secondary/90">
       <StyledSidebar title="Settings" items={navigation} />
-      {children}
+      <div className="flex-1 min-w-0">{children}</div>
     </div>
   )
 }

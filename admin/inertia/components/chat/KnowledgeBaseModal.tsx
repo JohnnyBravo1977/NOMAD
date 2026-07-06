@@ -10,10 +10,19 @@ import { IconX } from '@tabler/icons-react'
 import { useModals } from '~/context/ModalContext'
 import StyledModal from '../StyledModal'
 import ActiveEmbedJobs from '~/components/ActiveEmbedJobs'
+import type { ZimFileWithMetadata } from '../../../../types/zim'
 
 interface KnowledgeBaseModalProps {
   aiAssistantName?: string
   onClose: () => void
+}
+
+type KnowledgeBaseEntry = {
+  key: string
+  displayName: string
+  sourceType: 'uploaded' | 'zim'
+  source: string
+  deleteValue: string
 }
 
 function sourceToDisplayName(source: string): string {
@@ -36,16 +45,30 @@ export default function KnowledgeBaseModal({ aiAssistantName = "AI Assistant", o
     select: (data) => data || [],
   })
 
+  const { data: connectedZimFiles = [], isLoading: isLoadingZimFiles } = useQuery({
+    queryKey: ['connected-zim-files'],
+    queryFn: async () => {
+      const response = await api.listZimFiles()
+      return (response?.files || []) as ZimFileWithMetadata[]
+    },
+  })
+
   const uploadMutation = useMutation({
     mutationFn: (file: File) => api.uploadDocument(file),
   })
 
   const deleteMutation = useMutation({
-    mutationFn: (source: string) => api.deleteRAGFile(source),
+    mutationFn: async (entry: KnowledgeBaseEntry) => {
+      if (entry.sourceType === 'zim') {
+        return api.deleteZimFile(entry.deleteValue)
+      }
+      return api.deleteRAGFile(entry.deleteValue)
+    },
     onSuccess: () => {
       addNotification({ type: 'success', message: 'File removed from knowledge base.' })
       setConfirmDeleteSource(null)
       queryClient.invalidateQueries({ queryKey: ['storedFiles'] })
+      queryClient.invalidateQueries({ queryKey: ['connected-zim-files'] })
     },
     onError: (error: any) => {
       addNotification({ type: 'error', message: error?.message || 'Failed to delete file.' })
@@ -86,13 +109,13 @@ export default function KnowledgeBaseModal({ aiAssistantName = "AI Assistant", o
   const handleUpload = async () => {
     if (files.length === 0) return
     setIsUploading(true)
-    let successCount = 0
+    const successMessages: string[] = []
     const failedNames: string[] = []
 
     for (const file of files) {
       try {
-        await uploadMutation.mutateAsync(file)
-        successCount++
+        const result = await uploadMutation.mutateAsync(file)
+        successMessages.push(result?.message || `${file.name} queued for processing.`)
       } catch (error: any) {
         failedNames.push(file.name)
       }
@@ -102,12 +125,10 @@ export default function KnowledgeBaseModal({ aiAssistantName = "AI Assistant", o
     setFiles([])
     fileUploaderRef.current?.clear()
     queryClient.invalidateQueries({ queryKey: ['embed-jobs'] })
+    queryClient.invalidateQueries({ queryKey: ['storedFiles'] })
 
-    if (successCount > 0) {
-      addNotification({
-        type: 'success',
-        message: `${successCount} file${successCount > 1 ? 's' : ''} queued for processing.`,
-      })
+    for (const message of successMessages) {
+      addNotification({ type: 'success', message })
     }
     for (const name of failedNames) {
       addNotification({ type: 'error', message: `Failed to upload: ${name}` })
@@ -140,6 +161,23 @@ export default function KnowledgeBaseModal({ aiAssistantName = "AI Assistant", o
     )
   }
 
+  const knowledgeBaseEntries: KnowledgeBaseEntry[] = [
+    ...storedFiles.map((source) => ({
+      key: `uploaded:${source}`,
+      displayName: sourceToDisplayName(source),
+      sourceType: 'uploaded' as const,
+      source,
+      deleteValue: source,
+    })),
+    ...connectedZimFiles.map((file) => ({
+      key: `zim:${file.key}`,
+      displayName: file.title || file.name,
+      sourceType: 'zim' as const,
+      source: file.key,
+      deleteValue: file.name,
+    })),
+  ].sort((a, b) => a.displayName.localeCompare(b.displayName))
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/30 backdrop-blur-sm transition-opacity">
       <div className="bg-surface-primary rounded-lg shadow-xl max-w-4xl w-full max-h-[90vh] overflow-hidden flex flex-col">
@@ -163,6 +201,9 @@ export default function KnowledgeBaseModal({ aiAssistantName = "AI Assistant", o
                   setFiles(Array.from(uploadedFiles))
                 }}
               />
+              <div className="mt-3 text-sm text-text-secondary text-center">
+                Upload PDFs, text files, images, EPUBs, or ZIP archives. ZIPs are unpacked automatically and supported files are added to the Knowledge Base.
+              </div>
               <div className="flex justify-center gap-4 my-6">
                 <StyledButton
                   variant="primary"
@@ -250,7 +291,7 @@ export default function KnowledgeBaseModal({ aiAssistantName = "AI Assistant", o
 
           <div className="my-12">
             <div className='flex items-center justify-between mb-6'>
-              <StyledSectionHeader title="Stored Knowledge Base Files" className='!mb-0' />
+              <StyledSectionHeader title="Knowledge Base Files" className='!mb-0' />
               <StyledButton
                 variant="secondary"
                 size="md"
@@ -262,23 +303,48 @@ export default function KnowledgeBaseModal({ aiAssistantName = "AI Assistant", o
                 Sync Storage
               </StyledButton>
             </div>
-            <StyledTable<{ source: string }>
+            <div className="mb-4 grid gap-3 md:grid-cols-2">
+              <div className="rounded-lg border border-border-subtle bg-surface-secondary/60 px-4 py-3">
+                <div className="text-xs uppercase tracking-wide text-text-muted">Uploaded Library</div>
+                <div className="mt-1 text-2xl font-semibold text-text-primary">{storedFiles.length}</div>
+                <div className="text-sm text-text-secondary">User-uploaded PDFs, docs, and personal files</div>
+              </div>
+              <div className="rounded-lg border border-border-subtle bg-surface-secondary/60 px-4 py-3">
+                <div className="text-xs uppercase tracking-wide text-text-muted">Installed ZIM Sources</div>
+                <div className="mt-1 text-2xl font-semibold text-text-primary">
+                  {isLoadingZimFiles ? '…' : connectedZimFiles.length}
+                </div>
+                <div className="text-sm text-text-secondary">Offline libraries like Wikipedia and other knowledge packs</div>
+              </div>
+            </div>
+            <StyledTable<KnowledgeBaseEntry>
               className="font-semibold"
               rowLines={true}
               columns={[
                 {
-                  accessor: 'source',
+                  accessor: 'displayName',
                   title: 'File Name',
                   render(record) {
-                    return <span className="text-text-primary">{sourceToDisplayName(record.source)}</span>
+                    return <span className="text-text-primary">{record.displayName}</span>
                   },
                 },
                 {
-                  accessor: 'source',
+                  accessor: 'sourceType',
+                  title: 'Type',
+                  render(record) {
+                    return (
+                      <span className="rounded-full border border-border-subtle bg-surface-secondary px-2 py-1 text-xs text-text-secondary">
+                        {record.sourceType === 'zim' ? 'ZIM' : 'Uploaded'}
+                      </span>
+                    )
+                  },
+                },
+                {
+                  accessor: 'key',
                   title: '',
                   render(record) {
-                    const isConfirming = confirmDeleteSource === record.source
-                    const isDeleting = deleteMutation.isPending && confirmDeleteSource === record.source
+                    const isConfirming = confirmDeleteSource === record.key
+                    const isDeleting = deleteMutation.isPending && confirmDeleteSource === record.key
                     if (isConfirming) {
                       return (
                         <div className="flex items-center gap-2 justify-end">
@@ -286,7 +352,7 @@ export default function KnowledgeBaseModal({ aiAssistantName = "AI Assistant", o
                           <StyledButton
                             variant='danger'
                             size='sm'
-                            onClick={() => deleteMutation.mutate(record.source)}
+                            onClick={() => deleteMutation.mutate(record)}
                             disabled={isDeleting}
                           >
                             {isDeleting ? 'Deleting…' : 'Confirm'}
@@ -308,18 +374,23 @@ export default function KnowledgeBaseModal({ aiAssistantName = "AI Assistant", o
                           variant="danger"
                           size="sm"
                           icon="IconTrash"
-                          onClick={() => setConfirmDeleteSource(record.source)}
+                          onClick={() => setConfirmDeleteSource(record.key)}
                           disabled={deleteMutation.isPending}
-                          loading={deleteMutation.isPending && confirmDeleteSource === record.source}
+                          loading={deleteMutation.isPending && confirmDeleteSource === record.key}
                         >Delete</StyledButton>
                       </div>
                     )
                   },
                 },
               ]}
-              data={storedFiles.map((source) => ({ source }))}
-              loading={isLoadingFiles}
+              data={knowledgeBaseEntries}
+              loading={isLoadingFiles || isLoadingZimFiles}
             />
+            {!isLoadingFiles && !isLoadingZimFiles && knowledgeBaseEntries.length === 0 && (
+              <div className="mt-4 text-sm text-text-secondary">
+                No uploaded files or ZIM libraries are currently registered.
+              </div>
+            )}
           </div>
         </div>
       </div>

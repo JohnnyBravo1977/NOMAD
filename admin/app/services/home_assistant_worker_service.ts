@@ -4,6 +4,7 @@ import { HomeAssistantService } from '#services/home_assistant_service'
 type HaTask =
   | { kind: 'list_entities' }
   | { kind: 'get_state'; entityRef: string }
+  | { kind: 'get_light_brightness'; entityRef: string }
   | { kind: 'call_service'; domain: string; service: string; data: Record<string, any> }
   | { kind: 'call_service_group'; domain: string; service: string; entityRefs: string[] }
   | { kind: 'house_summary' }
@@ -14,6 +15,24 @@ type HaState = {
   state: string
   attributes?: Record<string, any>
 }
+
+const UNAVAILABLE_HA_STATES = new Set(['unavailable', 'unknown'])
+const GENERIC_ENTITY_TOKENS = new Set([
+  'light',
+  'lamp',
+  'switch',
+  'lock',
+  'door',
+  'fan',
+  'cover',
+  'scene',
+  'script',
+  'thermostat',
+  'temperature',
+  'mode',
+  'target',
+  'brightness',
+])
 
 @inject()
 export class HomeAssistantWorkerService {
@@ -27,6 +46,10 @@ export class HomeAssistantWorkerService {
       '- List entities',
       '- Read entity state by entity id or friendly name',
       '- Turn compatible entities on or off',
+      '- Set compatible light brightness',
+      '- Brighten or dim compatible lights and rooms',
+      '- Set compatible light colors and white temperature',
+      '- Apply simple lighting presets like movie, dinner, and night',
       '- Lock or unlock lock entities',
       '- Add items to the shopping list',
       '- Set thermostat-style target values for configured helpers',
@@ -54,7 +77,7 @@ export class HomeAssistantWorkerService {
   }
 
   async tryHandle(userText: string): Promise<string | null> {
-    const task = this.parseTask(userText)
+    const task = this.classify(userText)
     if (!task) return null
 
     const available = await this.homeAssistantService.isAvailable()
@@ -67,6 +90,8 @@ export class HomeAssistantWorkerService {
         return this.listEntities()
       case 'get_state':
         return this.getEntityState(task.entityRef)
+      case 'get_light_brightness':
+        return this.getLightBrightness(task.entityRef)
       case 'call_service':
         return this.callService(task.domain, task.service, task.data)
       case 'call_service_group':
@@ -80,6 +105,10 @@ export class HomeAssistantWorkerService {
     }
   }
 
+  classify(userText: string): HaTask | null {
+    return this.parseTask(userText)
+  }
+
   private parseTask(userText: string): HaTask | null {
     const text = userText.trim()
     let match: RegExpMatchArray | null
@@ -89,7 +118,7 @@ export class HomeAssistantWorkerService {
     }
 
     if (
-      /\b(house status|status of the house|status of house|house summary|summary of the house)\b/i.test(text)
+      /\b(house status|status of the house|status of house|status on the house|house summary|summary of the house)\b/i.test(text)
     ) {
       return { kind: 'house_summary' }
     }
@@ -107,6 +136,176 @@ export class HomeAssistantWorkerService {
           service: 'add_item',
           data: { entity_id: 'todo.shopping_list', item: match[1] },
         }
+      }
+    }
+
+    match = text.match(/\bwhat(?:['’]?s| is)\s+the\s+(.+?)\s+brightness\s+(?:set\s+to|at)\b/i)
+    if (match) {
+      const target = this.cleanEntityReference(match[1])
+      if (!target || this.isAmbiguousReference(target)) return null
+      return { kind: 'get_light_brightness', entityRef: target }
+    }
+
+    match =
+      text.match(/\bwhat(?:['’]?s| is)\s+the\s+(.+?)(?:\s*\?|$)/i) ||
+      text.match(/\bwhat\s+is\s+the\s+(.+?)(?:\s*\?|$)/i)
+    if (match) {
+      const target = this.cleanEntityReference(match[1])
+      if (!target || this.isAmbiguousReference(target)) return null
+      if (
+        /\b(water pressure|tank level|living room temperature|living room humidity|thermostat target temperature|thermostat mode|front door|porch light|sprinklers|water main|water supply alert)\b/i.test(
+          target
+        )
+      ) {
+        return { kind: 'get_state', entityRef: target }
+      }
+    }
+
+    match = text.match(/\bset\s+(.+?)\s+to\s+(\d{1,3})(?:\s*%|\s+percent)\s*$/i)
+    if (match) {
+      const target = this.cleanEntityReference(match[1])
+      if (!target || this.isAmbiguousReference(target)) return null
+      const brightness = Math.max(1, Math.min(100, Number(match[2])))
+      return {
+        kind: 'call_service',
+        domain: 'light',
+        service: 'turn_on',
+        data: { entity_ref: target, brightness_pct: brightness },
+      }
+    }
+
+    match = text.match(/\bset\s+(.+?)\s+brightness\s+to\s+(\d{1,3})(?:\s*%|\s+percent)?\b/i)
+    if (match) {
+      const target = this.cleanEntityReference(match[1])
+      if (!target || this.isAmbiguousReference(target)) return null
+      const brightness = Math.max(1, Math.min(100, Number(match[2])))
+      return {
+        kind: 'call_service',
+        domain: 'light',
+        service: 'turn_on',
+        data: { entity_ref: target, brightness_pct: brightness },
+      }
+    }
+
+    match = text.match(/\bdim\s+(.+?)\s+to\s+(\d{1,3})(?:\s*%|\s+percent)?\b/i)
+    if (match) {
+      const target = this.cleanEntityReference(match[1])
+      if (!target || this.isAmbiguousReference(target)) return null
+      const brightness = Math.max(1, Math.min(100, Number(match[2])))
+      return {
+        kind: 'call_service',
+        domain: 'light',
+        service: 'turn_on',
+        data: { entity_ref: target, brightness_pct: brightness },
+      }
+    }
+
+    match = text.match(/\b(?:make|turn)\s+(.+?)\s+(brighter|dimmer)\b/i)
+    if (match) {
+      const target = this.cleanEntityReference(match[1])
+      const direction = match[2].toLowerCase()
+      if (!target || this.isAmbiguousReference(target)) return null
+      return {
+        kind: 'call_service',
+        domain: 'light',
+        service: 'turn_on',
+        data: {
+          entity_ref: target,
+          brightness_step_pct: direction === 'brighter' ? 20 : -20,
+        },
+      }
+    }
+
+    match = text.match(/\bbrighten\s+(.+)\b/i)
+    if (match) {
+      const target = this.cleanEntityReference(match[1])
+      if (!target || this.isAmbiguousReference(target)) return null
+      return {
+        kind: 'call_service',
+        domain: 'light',
+        service: 'turn_on',
+        data: { entity_ref: target, brightness_step_pct: 20 },
+      }
+    }
+
+    match = text.match(/\b(?:dim|darken)\s+(.+)\b/i)
+    if (match) {
+      const target = this.cleanEntityReference(match[1])
+      if (!target || this.isAmbiguousReference(target)) return null
+      return {
+        kind: 'call_service',
+        domain: 'light',
+        service: 'turn_on',
+        data: { entity_ref: target, brightness_step_pct: -20 },
+      }
+    }
+
+    match = text.match(/\bset\s+(.+?)\s+color\s+to\s+(.+)\b/i)
+    if (match) {
+      const target = this.cleanEntityReference(match[1])
+      const colorValue = this.cleanEntityReference(match[2])
+      if (!target || !colorValue || this.isAmbiguousReference(target)) return null
+      const lightData = this.buildLightColorData(colorValue)
+      if (!lightData) return null
+      return {
+        kind: 'call_service',
+        domain: 'light',
+        service: 'turn_on',
+        data: { entity_ref: target, ...lightData },
+      }
+    }
+
+    match = text.match(/\bset\s+(.+?)\s+to\s+(movie|dinner|night)\s+mode\b/i)
+    if (match) {
+      const target = this.cleanEntityReference(match[1])
+      const preset = match[2].toLowerCase()
+      if (!target || this.isAmbiguousReference(target)) return null
+      return {
+        kind: 'call_service',
+        domain: 'light',
+        service: 'turn_on',
+        data: { entity_ref: target, ...this.buildLightPresetData(preset) },
+      }
+    }
+
+    match = text.match(/\bset\s+(.+?)\s+to\s+(movie|dinner|night)\b/i)
+    if (match) {
+      const target = this.cleanEntityReference(match[1])
+      const preset = match[2].toLowerCase()
+      if (!target || this.isAmbiguousReference(target)) return null
+      return {
+        kind: 'call_service',
+        domain: 'light',
+        service: 'turn_on',
+        data: { entity_ref: target, ...this.buildLightPresetData(preset) },
+      }
+    }
+
+    match = text.match(/\bmake\s+(.+?)\s+(movie|dinner|night)\b/i)
+    if (match) {
+      const target = this.cleanEntityReference(match[1])
+      const preset = match[2].toLowerCase()
+      if (!target || this.isAmbiguousReference(target)) return null
+      return {
+        kind: 'call_service',
+        domain: 'light',
+        service: 'turn_on',
+        data: { entity_ref: target, ...this.buildLightPresetData(preset) },
+      }
+    }
+
+    match = text.match(/\bmake\s+(.+?)\s+(warm daylight|warm white|soft white|neutral white|cool white|daylight|red|green|blue|purple|orange|yellow|pink|white)\b/i)
+    if (match) {
+      const target = this.cleanEntityReference(match[1])
+      const colorValue = this.cleanEntityReference(match[2])
+      if (!target || !colorValue || this.isAmbiguousReference(target)) return null
+      const lightData = this.buildLightColorData(colorValue)
+      if (!lightData) return null
+      return {
+        kind: 'call_service',
+        domain: 'light',
+        service: 'turn_on',
+        data: { entity_ref: target, ...lightData },
       }
     }
 
@@ -149,15 +348,15 @@ export class HomeAssistantWorkerService {
 
     match =
       text.match(/\b(?:state|status) of (?:entity )?([a-z0-9_]+\.[a-z0-9_]+)\b/i) ||
-      text.match(/\bwhat(?:'s| is) the state of (?:entity )?([a-z0-9_]+\.[a-z0-9_]+)\b/i)
+      text.match(/\bwhat(?:['’]?s| is) the state of (?:entity )?([a-z0-9_]+\.[a-z0-9_]+)\b/i)
     if (match) {
       return { kind: 'get_state', entityRef: match[1].toLowerCase() }
     }
 
     match =
       text.match(/\b(?:state|status) of (.+)\b/i) ||
-      text.match(/\bwhat(?:'s| is) the state of (.+)\b/i) ||
-      text.match(/\bwhat(?:'s| is) the status of (.+)\b/i)
+      text.match(/\bwhat(?:['’]?s| is) the state of (.+)\b/i) ||
+      text.match(/\bwhat(?:['’]?s| is) the status of (.+)\b/i)
     if (match) {
       const target = this.cleanEntityReference(match[1])
       if (this.isAmbiguousReference(target)) return null
@@ -202,6 +401,19 @@ export class HomeAssistantWorkerService {
       }
     }
 
+    match = text.match(/^(.+?)\s+(on|off)$/i)
+    if (match) {
+      const target = this.cleanEntityReference(match[1])
+      const action = match[2].toLowerCase()
+      if (!target || this.isAmbiguousReference(target)) return null
+      return {
+        kind: 'call_service',
+        domain: 'homeassistant',
+        service: action === 'on' ? 'turn_on' : 'turn_off',
+        data: { entity_ref: target },
+      }
+    }
+
     match = text.match(/\b(turn on|turn off|lock|unlock)\s+(.+)\b/i)
     if (match) {
       const action = match[1].toLowerCase()
@@ -220,10 +432,10 @@ export class HomeAssistantWorkerService {
         (/\ball\b.*\blight\b/.test(normalizedTarget) || /\ball\b.*\bmock light\b/.test(normalizedTarget))
       ) {
         return {
-          kind: 'call_service_group',
+          kind: 'call_service',
           domain: 'homeassistant',
           service: action === 'turn on' ? 'turn_on' : 'turn_off',
-          entityRefs: ['mock porch light'],
+          data: { entity_ref: '__all_lights__' },
         }
       }
       if (
@@ -282,29 +494,94 @@ export class HomeAssistantWorkerService {
   private async getEntityState(entityRef: string): Promise<string> {
     const state = await this.findBestEntityMatch(entityRef)
     if (state) {
+      if (this.isUnavailableState(state)) {
+        return `${this.formatFriendlyName(state)} is currently unavailable in Home Assistant.`
+      }
+      const houseSummaryLine = this.describeHouseSummaryLine(state)
+      if (houseSummaryLine) {
+        return houseSummaryLine
+      }
       return this.describeState(state)
     }
     return `I couldn't find a Home Assistant entity matching ${entityRef}.`
   }
 
-  private async callService(domain: string, service: string, data: Record<string, any>): Promise<string> {
-    const entityId = await this.resolveEntityIdForService(domain, data)
-    const serviceData = { ...data }
-    delete serviceData.entity_ref
-    if (entityId) {
-      serviceData.entity_id = entityId
+  private async getLightBrightness(entityRef: string): Promise<string> {
+    const state = await this.findBestEntityMatch(entityRef, ['light'])
+    if (!state) {
+      return `I couldn't find a light matching ${entityRef}.`
+    }
+    if (this.isUnavailableState(state)) {
+      return `${this.formatFriendlyName(state)} is currently unavailable in Home Assistant.`
     }
 
-    await this.homeAssistantService.callService(domain, service, serviceData)
-    if (!entityId) {
+    const rawBrightness = Number(state.attributes?.brightness)
+    if (!Number.isFinite(rawBrightness)) {
+      return `${this.formatFriendlyName(state)} does not report a brightness level.`
+    }
+
+    const brightnessPercent = Math.max(0, Math.min(100, Math.round((rawBrightness / 255) * 100)))
+    return `${this.formatFriendlyName(state)} is set to ${brightnessPercent}% brightness.`
+  }
+
+  private async callService(domain: string, service: string, data: Record<string, any>): Promise<string> {
+    const resolvedTargets = await this.resolveServiceTargets(domain, service, data)
+    const summaryData = { ...data }
+    const serviceData = { ...data }
+    delete serviceData.entity_ref
+    delete serviceData.quinn_preset
+    const entityIds = resolvedTargets.entityIds
+    if (entityIds.length === 1) {
+      serviceData.entity_id = entityIds[0]
+    } else if (entityIds.length > 1) {
+      serviceData.entity_id = entityIds
+    }
+
+    if (entityIds.length > 0) {
+      const stateMapBefore = await this.buildStateMap()
+      const statesBefore = entityIds.map((entityId) => stateMapBefore.get(entityId) || null)
+      const liveStatesBefore = statesBefore.filter((state): state is HaState => Boolean(state))
+      const unavailableTargets = statesBefore
+        .filter((state): state is HaState => Boolean(state))
+        .filter((state) => this.isUnavailableState(state))
+
+      if (unavailableTargets.length > 0) {
+        if (unavailableTargets.length === 1) {
+          return `${this.formatFriendlyName(unavailableTargets[0])} is currently unavailable in Home Assistant, so I did not send that command.`
+        }
+        return `${unavailableTargets.length} Home Assistant targets are currently unavailable, so I did not send that command.`
+      }
+
+      if (domain === 'input_number' && service === 'set_value' && typeof serviceData.value === 'number') {
+        const rangeError = this.describeInputNumberRangeError(liveStatesBefore, serviceData.value)
+        if (rangeError) {
+          return rangeError
+        }
+      }
+    }
+
+    try {
+      await this.homeAssistantService.callService(domain, service, serviceData)
+    } catch (error) {
+      if (domain === 'input_number' && service === 'set_value' && typeof serviceData.value === 'number') {
+        return `I couldn't set that value in Home Assistant. It looks outside the allowed range.`
+      }
+      throw error
+    }
+    if (!entityIds.length) {
       return `Home Assistant service ${domain}.${service} completed.`
     }
 
-    const state = await this.homeAssistantService.getState(entityId)
-    if (!state) {
-      return `I completed ${domain}.${service} for ${entityId}.`
+    const stateMapAfter = await this.buildStateMap()
+    const states = entityIds.map((entityId) => stateMapAfter.get(entityId) || null)
+    const liveStates = states.filter((state): state is HaState => Boolean(state))
+    if (!liveStates.length) {
+      return entityIds.length === 1
+        ? `I completed ${domain}.${service} for ${entityIds[0]}.`
+        : `I completed ${domain}.${service} for ${entityIds.length} items.`
     }
-    return this.describeServiceOutcome(domain, service, [state])
+
+    return this.describeServiceOutcome(domain, service, liveStates, summaryData, resolvedTargets.label)
   }
 
   private async callGroupService(
@@ -329,11 +606,13 @@ export class HomeAssistantWorkerService {
 
     await this.homeAssistantService.callService(domain, service, { entity_id: entityIds })
 
-    const states = await Promise.all(entityIds.map((entityId) => this.homeAssistantService.getState(entityId)))
+    const stateMap = await this.buildStateMap()
+    const states = entityIds.map((entityId) => stateMap.get(entityId) || null)
     return this.describeServiceOutcome(
       domain,
       service,
-      states.filter((state): state is HaState => Boolean(state))
+      states.filter((state): state is HaState => Boolean(state)),
+      { entity_id: entityIds }
     )
   }
 
@@ -353,23 +632,41 @@ export class HomeAssistantWorkerService {
     ]
 
     const states = await Promise.all(targets.map((target) => this.findBestEntityMatch(target)))
-    const lines = states.filter(Boolean).map((state) => this.describeState(state!))
+    const lines = states
+      .filter((state): state is HaState => Boolean(state))
+      .map((state) => this.describeHouseSummaryLine(state))
+      .filter(Boolean)
 
     if (!lines.length) {
       return `I couldn't build a house summary because the mock Home Assistant entities are missing.`
     }
 
-    return `House status summary:\n${lines.join('\n\n')}`
+    return [
+      `Here’s the current house status:`,
+      ...lines.map((line) => `- ${line}`),
+    ].join('\n')
   }
 
-  private describeServiceOutcome(domain: string, service: string, states: HaState[]): string {
-    const descriptions = states.map((state) => this.describeState(state))
-    const summary = this.describeActionSummary(domain, service, states)
-    return descriptions.length > 0 ? `${summary}\n\n${descriptions.join('\n\n')}` : summary
+  private describeServiceOutcome(
+    domain: string,
+    service: string,
+    states: HaState[],
+    data?: Record<string, any>,
+    targetLabel?: string
+  ): string {
+    const summary = this.describeActionSummary(domain, service, states, data, targetLabel)
+    return summary
   }
 
-  private describeActionSummary(domain: string, service: string, states: HaState[]): string {
+  private describeActionSummary(
+    domain: string,
+    service: string,
+    states: HaState[],
+    data?: Record<string, any>,
+    targetLabel?: string
+  ): string {
     const count = states.length
+    const targetName = this.formatTargetLabel(targetLabel, states, count)
     if (domain === 'lock' && service === 'lock') {
       return count === 1 ? `I locked ${this.formatFriendlyName(states[0])}.` : `I locked ${count} doors.`
     }
@@ -377,13 +674,30 @@ export class HomeAssistantWorkerService {
       return count === 1 ? `I unlocked ${this.formatFriendlyName(states[0])}.` : `I unlocked ${count} doors.`
     }
     if ((domain === 'homeassistant' || domain === 'light' || domain === 'switch' || domain === 'input_boolean') && service === 'turn_off') {
-      return count === 1 ? `I turned off ${this.formatFriendlyName(states[0])}.` : `I turned off ${count} items.`
+      return count === 1 ? `I turned off ${targetName}.` : `I turned off ${targetName}.`
     }
     if ((domain === 'homeassistant' || domain === 'light' || domain === 'switch' || domain === 'input_boolean') && service === 'turn_on') {
-      return count === 1 ? `I turned on ${this.formatFriendlyName(states[0])}.` : `I turned on ${count} items.`
+      if (states[0] && typeof data?.quinn_preset === 'string') {
+        return `I set ${targetName} to ${data.quinn_preset} mode.`
+      }
+      if (states[0] && typeof data?.brightness_pct === 'number') {
+        return `I set ${targetName} to ${Math.round(data.brightness_pct)}% brightness.`
+      }
+      if (states[0] && typeof data?.brightness_step_pct === 'number') {
+        return data.brightness_step_pct > 0
+          ? `I made ${targetName} brighter.`
+          : `I dimmed ${targetName}.`
+      }
+      if (states[0] && typeof data?.color_name === 'string') {
+        return `I set ${targetName} to ${data.color_name}.`
+      }
+      if (states[0] && typeof data?.color_temp_kelvin === 'number') {
+        return `I set ${targetName} to ${this.describeKelvinLabel(data.color_temp_kelvin)}.`
+      }
+      return count === 1 ? `I turned on ${targetName}.` : `I turned on ${targetName}.`
     }
     if (domain === 'input_number' && service === 'set_value' && states[0]) {
-      return `I set ${this.formatFriendlyName(states[0])} to ${states[0].state}.`
+      return `I set ${this.formatFriendlyName(states[0])} to ${this.formatNumberState(states[0].state)}.`
     }
     if (domain === 'input_select' && service === 'select_option' && states[0]) {
       return `I set ${this.formatFriendlyName(states[0])} to ${states[0].state}.`
@@ -418,30 +732,30 @@ export class HomeAssistantWorkerService {
 
     const frontDoor = stateMap.get('lock.mock_front_door')
     if (frontDoor?.state !== 'locked') {
-      issues.push('Mock front door is unlocked.')
+      issues.push('Front door is unlocked.')
     }
 
     const porchLight = stateMap.get('light.mock_porch_light') || stateMap.get('input_boolean.mock_porch_light')
     if (porchLight?.state === 'on') {
-      issues.push('Mock porch light is on.')
+      issues.push('Porch light is on.')
     }
 
     const sprinklers = stateMap.get('switch.mock_sprinklers') || stateMap.get('input_boolean.mock_sprinklers')
     if (sprinklers?.state === 'on') {
-      issues.push('Mock sprinklers are running.')
+      issues.push('Sprinklers are running.')
     }
 
     const waterAlert =
       stateMap.get('binary_sensor.mock_water_supply_alert') ||
       stateMap.get('input_boolean.mock_water_supply_alert')
     if (waterAlert?.state === 'on') {
-      issues.push('Mock water supply alert is active.')
+      issues.push('Water supply alert is active.')
     }
 
     const waterMain =
       stateMap.get('binary_sensor.mock_water_main_open') || stateMap.get('input_boolean.mock_water_main_open')
     if (waterMain?.state === 'off') {
-      issues.push('Mock water main is shut off.')
+      issues.push('Water main is shut off.')
     }
 
     const temp = Number(
@@ -449,7 +763,7 @@ export class HomeAssistantWorkerService {
         stateMap.get('input_number.mock_living_room_temperature')?.state
     )
     if (Number.isFinite(temp) && (temp < 60 || temp > 80)) {
-      issues.push(`Mock living room temperature is ${temp}F.`)
+      issues.push(`Living room temperature is ${this.formatNumberState(String(temp))} degrees Fahrenheit.`)
     }
 
     const humidity = Number(
@@ -457,7 +771,7 @@ export class HomeAssistantWorkerService {
         stateMap.get('input_number.mock_living_room_humidity')?.state
     )
     if (Number.isFinite(humidity) && (humidity < 25 || humidity > 65)) {
-      issues.push(`Mock living room humidity is ${humidity}%.`)
+      issues.push(`Living room humidity is ${this.formatNumberState(String(humidity))}%.`)
     }
 
     const waterPressure = Number(
@@ -465,21 +779,69 @@ export class HomeAssistantWorkerService {
         stateMap.get('input_number.mock_water_pressure')?.state
     )
     if (Number.isFinite(waterPressure) && waterPressure < 20) {
-      issues.push(`Mock water pressure is low at ${waterPressure} psi.`)
+      issues.push(`Water pressure is low at ${this.formatNumberState(String(waterPressure))} psi.`)
     }
 
     const tankLevel = Number(
       stateMap.get('sensor.mock_tank_level')?.state || stateMap.get('input_number.mock_tank_level')?.state
     )
     if (Number.isFinite(tankLevel) && tankLevel < 25) {
-      issues.push(`Mock tank level is low at ${tankLevel}%.`)
+      issues.push(`Tank level is low at ${this.formatNumberState(String(tankLevel))}%.`)
     }
 
     if (!issues.length) {
-      return 'Nothing urgent needs attention in the mock house right now.'
+      return 'Nothing urgent needs attention in the house right now.'
     }
 
-    return `House attention summary:\n${issues.join('\n')}`
+    return [
+      'Here is what needs attention in the house:',
+      ...issues.map((issue) => `- ${issue}`),
+    ].join('\n')
+  }
+
+  private describeHouseSummaryLine(state: HaState): string | null {
+    switch (state.entity_id) {
+      case 'lock.mock_front_door':
+        return `The front door is ${state.state}.`
+      case 'input_boolean.mock_porch_light':
+      case 'light.mock_porch_light':
+        return `The porch light is ${state.state}.`
+      case 'input_boolean.mock_sprinklers':
+      case 'switch.mock_sprinklers':
+        return `The sprinklers are ${state.state}.`
+      case 'input_number.mock_thermostat_target_temperature':
+      case 'sensor.mock_thermostat_target_temperature':
+        return `The thermostat target is ${this.formatNumberState(state.state)} degrees Fahrenheit.`
+      case 'input_select.mock_thermostat_mode':
+      case 'sensor.mock_thermostat_mode':
+        return `The thermostat mode is ${state.state}.`
+      case 'input_number.mock_living_room_temperature':
+      case 'sensor.mock_living_room_temperature':
+        return `The living room temperature is ${this.formatNumberState(state.state)} degrees Fahrenheit.`
+      case 'input_number.mock_living_room_humidity':
+      case 'sensor.mock_living_room_humidity':
+        return `The living room humidity is ${this.formatNumberState(state.state)}%.`
+      case 'input_number.mock_water_pressure':
+      case 'sensor.mock_water_pressure':
+        return `The water pressure is ${this.formatNumberState(state.state)} psi.`
+      case 'input_number.mock_tank_level':
+      case 'sensor.mock_tank_level':
+        return `The tank level is ${this.formatNumberState(state.state)}%.`
+      case 'input_boolean.mock_water_main_open':
+      case 'binary_sensor.mock_water_main_open':
+        return `The water main is ${state.state === 'on' ? 'open' : 'closed'}.`
+      case 'input_boolean.mock_water_supply_alert':
+      case 'binary_sensor.mock_water_supply_alert':
+        return `The water supply alert is ${state.state === 'on' ? 'active' : 'clear'}.`
+      default:
+        return `${this.formatFriendlyName(state)} is ${state.state}.`
+    }
+  }
+
+  private formatNumberState(value: string): string {
+    const number = Number(value)
+    if (!Number.isFinite(number)) return value
+    return Number.isInteger(number) ? String(number) : number.toFixed(1)
   }
 
   private describeState(state: { entity_id: string; state: string; attributes?: Record<string, any> }): string {
@@ -498,8 +860,93 @@ export class HomeAssistantWorkerService {
     if (!state) return 'it'
     const friendlyName = state.attributes?.friendly_name
     return typeof friendlyName === 'string' && friendlyName.trim().length > 0
-      ? friendlyName
+      ? friendlyName.trim().replace(/^mock\s+/i, '')
       : state.entity_id
+  }
+
+  private describeInputNumberRangeError(states: HaState[], value: number): string | null {
+    const state = states[0]
+    if (!state) return null
+
+    const min = Number(state.attributes?.min)
+    const max = Number(state.attributes?.max)
+    if (!Number.isFinite(min) || !Number.isFinite(max)) {
+      return null
+    }
+
+    if (value < min || value > max) {
+      return `I couldn't set ${this.formatFriendlyName(state)} to ${value}. Home Assistant allows values from ${this.formatNumberState(String(min))} to ${this.formatNumberState(String(max))}.`
+    }
+
+    return null
+  }
+
+  private formatTargetLabel(targetLabel: string | undefined, states: HaState[], count: number): string {
+    if (targetLabel && targetLabel.trim()) {
+      if (targetLabel.trim().toLowerCase() === 'all') {
+        return 'all lights'
+      }
+      return count === 1 ? `the ${targetLabel} light` : `the ${targetLabel} lights`
+    }
+
+    if (count === 1) {
+      return this.formatFriendlyName(states[0])
+    }
+
+    return `${count} items`
+  }
+
+  private buildLightColorData(value: string): Record<string, any> | null {
+    const normalized = this.normalizeText(value)
+    if (!normalized) return null
+
+    const kelvinByLabel: Record<string, number> = {
+      'warm white': 2700,
+      'soft white': 3000,
+      'neutral white': 4000,
+      'cool white': 5000,
+      'warm daylight': 6500,
+      daylight: 6500,
+    }
+
+    if (normalized in kelvinByLabel) {
+      return { color_temp_kelvin: kelvinByLabel[normalized] }
+    }
+
+    const allowedColorNames = new Set([
+      'red',
+      'green',
+      'blue',
+      'purple',
+      'orange',
+      'yellow',
+      'pink',
+      'white',
+    ])
+
+    if (allowedColorNames.has(normalized)) {
+      return { color_name: normalized }
+    }
+
+    return null
+  }
+
+  private buildLightPresetData(value: string): Record<string, any> {
+    const normalized = this.normalizeText(value)
+    if (normalized === 'movie') {
+      return { brightness_pct: 20, color_temp_kelvin: 2700, quinn_preset: 'movie' }
+    }
+    if (normalized === 'dinner') {
+      return { brightness_pct: 45, color_temp_kelvin: 2700, quinn_preset: 'dinner' }
+    }
+    return { brightness_pct: 10, color_temp_kelvin: 2200, quinn_preset: 'night' }
+  }
+
+  private describeKelvinLabel(kelvin: number): string {
+    if (kelvin <= 3000) return 'warm white'
+    if (kelvin <= 4500) return 'neutral white'
+    if (kelvin <= 5700) return 'cool white'
+    return 'daylight'
   }
 
   private cleanEntityReference(value: string): string {
@@ -507,7 +954,8 @@ export class HomeAssistantWorkerService {
       .trim()
       .replace(/[?.!,]+$/g, '')
       .replace(/^(?:the|a|an)\s+/i, '')
-      .replace(/\s+(?:please|for me)$/i, '')
+      .replace(/^(?:(?:oh|uh|um|well|please)\s+)+/i, '')
+      .replace(/\s+(?:please|for me|thanks|thank you|okay|ok|oh|uh|um)$/i, '')
       .trim()
   }
 
@@ -523,7 +971,15 @@ export class HomeAssistantWorkerService {
       .trim()
   }
 
-  private async resolveEntityIdForService(domain: string, data: Record<string, any>): Promise<string | null> {
+  private isUnavailableState(state?: HaState | null): boolean {
+    return !!state && UNAVAILABLE_HA_STATES.has(String(state.state || '').toLowerCase())
+  }
+
+  private async resolveEntityIdForService(
+    domain: string,
+    data: Record<string, any>,
+    options?: { requireAvailable?: boolean }
+  ): Promise<string | null> {
     if (typeof data.entity_id === 'string') {
       return data.entity_id
     }
@@ -542,15 +998,72 @@ export class HomeAssistantWorkerService {
           ? ['light', 'switch', 'fan', 'cover', 'script', 'scene', 'input_boolean']
           : [domain]
 
-    const match = await this.findBestEntityMatch(entityRef, domainHints)
+    const match = await this.findBestEntityMatch(entityRef, domainHints, {
+      preferAvailable: options?.requireAvailable === true,
+    })
     if (!match) {
       throw new Error(`I couldn't find a Home Assistant entity matching ${entityRef}.`)
+    }
+    if (options?.requireAvailable === true && this.isUnavailableState(match)) {
+      throw new Error(`${this.formatFriendlyName(match)} is currently unavailable in Home Assistant.`)
     }
 
     return match.entity_id
   }
 
-  private async findBestEntityMatch(entityRef: string, domainHints?: string[]): Promise<HaState | null> {
+  private async resolveServiceTargets(
+    domain: string,
+    service: string,
+    data: Record<string, any>
+  ): Promise<{ entityIds: string[]; label?: string }> {
+    if (typeof data.entity_id === 'string') {
+      return { entityIds: [data.entity_id] }
+    }
+
+    if (Array.isArray(data.entity_id)) {
+      return { entityIds: data.entity_id.filter((value): value is string => typeof value === 'string' && value.length > 0) }
+    }
+
+    const entityRef = typeof data.entity_ref === 'string' ? data.entity_ref : null
+    if (!entityRef) return { entityIds: [] }
+
+    if (entityRef === '__all_lights__') {
+      const states = await this.homeAssistantService.getStates()
+      const entityIds = states
+        .filter((state) => state.entity_id.startsWith('light.'))
+        .map((state) => state.entity_id)
+
+      return {
+        entityIds,
+        label: 'all',
+      }
+    }
+
+    const isLightControl =
+      (domain === 'light' || domain === 'homeassistant') &&
+      (service === 'turn_on' || service === 'turn_off')
+
+    if (isLightControl) {
+      const areaTargets = await this.homeAssistantService.findAreaLightTargets(entityRef)
+      if (areaTargets?.entityIds.length) {
+        return {
+          entityIds: areaTargets.entityIds,
+          label: areaTargets.areaName,
+        }
+      }
+    }
+
+    const entityId = await this.resolveEntityIdForService(domain, data, {
+      requireAvailable: true,
+    })
+    return entityId ? { entityIds: [entityId] } : { entityIds: [] }
+  }
+
+  private async findBestEntityMatch(
+    entityRef: string,
+    domainHints?: string[],
+    options?: { preferAvailable?: boolean }
+  ): Promise<HaState | null> {
     if (this.isEntityId(entityRef)) {
       try {
         const direct = await this.homeAssistantService.getState(entityRef)
@@ -570,8 +1083,13 @@ export class HomeAssistantWorkerService {
 
     let best: { state: HaState; score: number } | null = null
     for (const state of filteredStates) {
-      const score = this.scoreEntityMatch(state, normalizedNeedle)
-      if (score <= 0) continue
+      const baseScore = this.scoreEntityMatch(state, normalizedNeedle)
+      if (baseScore <= 0) continue
+
+      let score = baseScore
+      if (options?.preferAvailable) {
+        score += this.isUnavailableState(state) ? -25 : 5
+      }
       if (!best || score > best.score) {
         best = { state, score }
       }
@@ -594,10 +1112,18 @@ export class HomeAssistantWorkerService {
 
     const needleTokens = normalizedNeedle.split(' ').filter(Boolean)
     if (!needleTokens.length) return 0
+    const specificNeedleTokens = needleTokens.filter((token) => !GENERIC_ENTITY_TOKENS.has(token))
 
     let bestScore = 0
     for (const haystack of haystacks) {
       const haystackTokens = new Set(haystack.split(' ').filter(Boolean))
+      if (
+        specificNeedleTokens.length > 0 &&
+        specificNeedleTokens.some((token) => !haystackTokens.has(token))
+      ) {
+        continue
+      }
+
       const matchedTokens = needleTokens.filter((token) => haystackTokens.has(token)).length
       if (!matchedTokens) continue
 
@@ -608,5 +1134,10 @@ export class HomeAssistantWorkerService {
     }
 
     return bestScore
+  }
+
+  private async buildStateMap(): Promise<Map<string, HaState>> {
+    const states = await this.homeAssistantService.getStates()
+    return new Map(states.map((state) => [state.entity_id, state]))
   }
 }

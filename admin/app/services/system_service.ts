@@ -155,21 +155,7 @@ export class SystemService {
     vram: number
   }> | null> {
     try {
-      // If a remote Ollama URL is configured, use it directly without requiring a local container
       const remoteOllamaUrl = await KVStore.getValue('ai.remoteOllamaUrl')
-      if (!remoteOllamaUrl) {
-        const containers = await this.dockerService.docker.listContainers({ all: false })
-        const ollamaContainer = containers.find((c) => c.Names.includes(`/${SERVICE_NAMES.OLLAMA}`))
-        if (!ollamaContainer) {
-          return null
-        }
-
-        const actualImage = (ollamaContainer.Image || '').toLowerCase()
-        if (actualImage.includes('ollama/ollama') || actualImage.startsWith('ollama:')) {
-          return null
-        }
-      }
-
       const ollamaUrl = remoteOllamaUrl || (await this.dockerService.getServiceURL(SERVICE_NAMES.OLLAMA))
       if (!ollamaUrl) {
         return null
@@ -177,6 +163,7 @@ export class SystemService {
 
       await axios.get(new URL('/api/tags', ollamaUrl).toString(), { timeout: 3000 })
 
+      let gpuLoaded = false
       let vramMb = 0
       try {
         const psResponse = await axios.get(new URL('/api/ps', ollamaUrl).toString(), {
@@ -188,13 +175,18 @@ export class SystemService {
             Math.max(max, Number(model.size_vram) || 0),
           0
         )
+        gpuLoaded = largestAllocation > 0
         vramMb = largestAllocation > 0 ? Math.round(largestAllocation / (1024 * 1024)) : 0
       } catch {}
+
+      if (!gpuLoaded) {
+        return null
+      }
 
       return [
         {
           vendor: 'NVIDIA',
-          model: 'NVIDIA GPU (external Ollama)',
+          model: remoteOllamaUrl ? 'NVIDIA GPU (external Ollama)' : 'NVIDIA GPU (Ollama)',
           vram: vramMb,
         },
       ]

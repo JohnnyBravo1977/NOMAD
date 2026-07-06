@@ -1,0 +1,22 @@
+[Unit]
+Description=N.O.M.A.D. host action broker
+After=network.target graphical.target
+Wants=graphical.target
+
+[Service]
+Type=simple
+User=nomad
+Group=nomad
+WorkingDirectory=/home/nomad/Project
+Environment=HOME=/home/nomad
+Environment=XDG_CONFIG_HOME=/home/nomad/.config
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+Environment=DISPLAY=:0
+Environment=NOMAD_HOST_BROKER_TOKEN=nomad-host-broker-2026-04-18
+ExecStart=/usr/bin/python3 /data/projects/NOMAD/install/host-action-broker.py --host 0.0.0.0 --port 8765
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

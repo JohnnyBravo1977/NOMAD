@@ -5,6 +5,7 @@ import { FileEntry } from '../../types/files'
 import { CheckLatestVersionResult, SystemInformationResponse, SystemUpdateStatus } from '../../types/system'
 import { DownloadJobWithProgress, WikipediaState } from '../../types/downloads'
 import { EmbedJobWithProgress } from '../../types/rag'
+import type { ChatAttachment } from '../../types/chat'
 import type { CategoryWithStatus, CollectionWithStatus, ContentUpdateCheckResult, ResourceUpdateInfo } from '../../types/collections'
 import { catchInternal } from './util'
 import { NomadChatResponse, NomadInstalledModel, NomadOllamaModel, OllamaChatRequest } from '../../types/ollama'
@@ -21,6 +22,24 @@ class API {
         'Content-Type': 'application/json',
       },
     })
+  }
+
+  private async encodeOptionalReferenceAudio(file?: File | null) {
+    if (!file) return {}
+
+    const buffer = await file.arrayBuffer()
+    let binary = ''
+    const bytes = new Uint8Array(buffer)
+    const chunkSize = 0x8000
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      const chunk = bytes.subarray(offset, offset + chunkSize)
+      binary += String.fromCharCode(...chunk)
+    }
+
+    return {
+      referenceAudioBase64: btoa(binary),
+      referenceAudioFilename: file.name,
+    }
   }
 
   async affectService(service_name: string, action: 'start' | 'stop' | 'restart') {
@@ -281,6 +300,23 @@ class API {
     })()
   }
 
+  async uploadChatAttachment(file: File) {
+    return catchInternal(async () => {
+      const formData = new FormData()
+      formData.append('file', file)
+      const response = await this.client.post<{ attachment: ChatAttachment }>(
+        '/chat/sessions/attachments',
+        formData,
+        {
+          headers: {
+            'Content-Type': 'multipart/form-data',
+          },
+        }
+      )
+      return response.data.attachment
+    })()
+  }
+
   async streamChatMessage(
     chatRequest: OllamaChatRequest,
     onChunk: (content: string, thinking: string, done: boolean) => void,
@@ -289,6 +325,7 @@ class API {
     // Axios doesn't support ReadableStream in browser, so need to use fetch
     const response = await fetch('/api/ollama/chat', {
       method: 'POST',
+      credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...chatRequest, stream: true }),
       signal,
@@ -332,6 +369,204 @@ class API {
     }
   }
 
+  async getComfySpeechStatus() {
+    return catchInternal(async () => {
+      const response = await this.client.get<{
+        available: boolean
+        speakers: string[]
+        defaultSpeaker: string
+        defaultModelSize: '0.6B' | '1.7B'
+      }>('/comfyui/tts/status')
+      return response.data
+    })()
+  }
+
+  async getComfyVoices() {
+    return catchInternal(async () => {
+      const response = await this.client.get<{
+        status: {
+          available: boolean
+          speakers: string[]
+          defaultSpeaker: string
+          defaultModelSize: '0.6B' | '1.7B'
+        }
+        characters: Array<{
+          id: string
+          name: string
+          engine: 'voice_design' | 'voice_clone'
+          gender?: 'male' | 'female'
+          description?: string
+          referenceText?: string
+          referenceAudioName?: string
+          createdAt: string
+          updatedAt: string
+        }>
+      }>('/comfyui/voices')
+      return response.data
+    })()
+  }
+
+  async saveComfyVoice(payload: {
+    id?: string
+    name: string
+    gender: 'male' | 'female'
+    description: string
+    speakingStyle?: string
+  }) {
+    return catchInternal(async () => {
+      const response = await this.client.post<{
+        character: any
+        characters: any[]
+      }>('/comfyui/voices', payload)
+      return response.data
+    })()
+  }
+
+  async saveComfyClonedVoice(payload: {
+    id?: string
+    name: string
+    referenceText: string
+    speakingStyle?: string
+    referenceAudio?: File | null
+  }) {
+    const formData = new FormData()
+    formData.append('name', payload.name)
+    formData.append('referenceText', payload.referenceText)
+    formData.append('speakingStyle', payload.speakingStyle || '')
+    if (payload.id) {
+      formData.append('id', payload.id)
+    }
+    if (payload.referenceAudio) {
+      formData.append('referenceAudio', payload.referenceAudio)
+    }
+
+    const response = await fetch('/api/comfyui/voices/clone', {
+      method: 'POST',
+      credentials: 'same-origin',
+      body: formData,
+    })
+
+    let data: any = null
+    try {
+      data = await response.json()
+    } catch {
+      data = null
+    }
+
+    if (!response.ok) {
+      const message =
+        typeof data?.error === 'string' && data.error.trim()
+          ? data.error.trim()
+          : `Clone save failed (${response.status})`
+      throw new Error(message)
+    }
+
+    return data
+  }
+
+  async deleteComfyVoice(id: string) {
+    return catchInternal(async () => {
+      const response = await this.client.delete<{ success: boolean; characters: any[] }>(
+        `/comfyui/voices/${id}`
+      )
+      return response.data
+    })()
+  }
+
+  async synthesizeComfySpeech(payload: {
+    text: string
+    engine?: 'custom_voice' | 'voice_design' | 'voice_clone'
+    speaker?: string
+    characterId?: string
+    modelSize?: '0.6B' | '1.7B'
+    language?: string
+    instruct?: string
+    gender?: 'male' | 'female'
+    description?: string
+    delivery?: string
+    referenceText?: string
+    referenceAudio?: File | null
+  }): Promise<Blob> {
+    const encodedReference = await this.encodeOptionalReferenceAudio(payload.referenceAudio)
+    const response = await fetch('/api/comfyui/tts/speak', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...payload,
+        ...encodedReference,
+        referenceAudio: undefined,
+      }),
+    })
+
+    if (!response.ok) {
+      let message = `Speech request failed (${response.status})`
+      try {
+        const data = await response.json()
+        if (typeof data?.error === 'string' && data.error.trim()) {
+          message = data.error.trim()
+        }
+      } catch {
+        // ignore parse errors
+      }
+      throw new Error(message)
+    }
+
+    return await response.blob()
+  }
+
+  async streamComfySpeech(payload: {
+    text: string
+    engine?: 'custom_voice' | 'voice_design' | 'voice_clone'
+    speaker?: string
+    characterId?: string
+    modelSize?: '0.6B' | '1.7B'
+    language?: string
+    instruct?: string
+    gender?: 'male' | 'female'
+    description?: string
+    delivery?: string
+    referenceText?: string
+    referenceAudio?: File | null
+  }): Promise<{
+    reader: ReadableStreamDefaultReader<Uint8Array>
+    sampleRate: number
+    channels: number
+    format: string
+  }> {
+    const encodedReference = await this.encodeOptionalReferenceAudio(payload.referenceAudio)
+    const response = await fetch('/api/comfyui/tts/stream', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...payload,
+        ...encodedReference,
+        referenceAudio: undefined,
+      }),
+    })
+
+    if (!response.ok || !response.body) {
+      let message = `Speech stream failed (${response.status})`
+      try {
+        const data = await response.json()
+        if (typeof data?.error === 'string' && data.error.trim()) {
+          message = data.error.trim()
+        }
+      } catch {
+        // ignore parse errors
+      }
+      throw new Error(message)
+    }
+
+    return {
+      reader: response.body.getReader(),
+      sampleRate: Number(response.headers.get('x-audio-sample-rate') || '24000'),
+      channels: Number(response.headers.get('x-audio-channels') || '1'),
+      format: response.headers.get('x-audio-format') || 'pcm_s16le',
+    }
+  }
+
   async getBenchmarkResults() {
     return catchInternal(async () => {
       const response = await this.client.get<{ results: BenchmarkResult[], total: number }>('/benchmark/results')
@@ -372,6 +607,7 @@ class API {
           id: string
           role: 'system' | 'user' | 'assistant'
           content: string
+          attachments?: ChatAttachment[]
           timestamp: string
         }>
       }>(`/chat/sessions/${sessionId}`)
@@ -455,6 +691,95 @@ class API {
     return catchInternal(async () => {
       const response = await this.client.get<{ files: string[] }>('/rag/files')
       return response.data.files
+    })()
+  }
+
+  async getUserSpaceContext() {
+    return catchInternal(async () => {
+      const response = await this.client.get<{
+        current: any
+        users: Array<{ id: number; displayName: string; role: 'admin' | 'user'; isActive: boolean }>
+        family: { id: number; slug: string; name: string; allowMemberFamilyUploads: boolean }
+      }>('/users/context')
+      return response.data
+    })()
+  }
+
+  async selectUserSpace(userId: number) {
+    return catchInternal(async () => {
+      const response = await this.client.post<{
+        current: any
+        users: Array<{ id: number; displayName: string; role: 'admin' | 'user'; isActive: boolean }>
+        family: { id: number; slug: string; name: string; allowMemberFamilyUploads: boolean }
+      }>('/users/select', { userId })
+      return response.data
+    })()
+  }
+
+  async getUsers() {
+    return catchInternal(async () => {
+      const response = await this.client.get<{ users: any[] }>('/users')
+      return response.data
+    })()
+  }
+
+  async createUser(payload: { displayName: string; username: string; pin: string; role: 'admin' | 'user' }) {
+    return catchInternal(async () => {
+      const response = await this.client.post<{ user: any }>('/users', payload)
+      return response.data
+    })()
+  }
+
+  async updateUser(
+    userId: number,
+    payload: {
+      displayName?: string
+      username?: string
+      pin?: string
+      role?: 'admin' | 'user'
+      isActive?: boolean
+    }
+  ) {
+    return catchInternal(async () => {
+      const response = await this.client.patch<{ user: any }>(`/users/${userId}`, payload)
+      return response.data
+    })()
+  }
+
+  async login(payload: { username: string; pin: string }) {
+    return catchInternal(async () => {
+      const response = await this.client.post<{ current: any }>('/auth/login', payload)
+      return response.data
+    })()
+  }
+
+  async quickCreateUserFromLogin(payload: {
+    adminUsername: string
+    adminPin: string
+    displayName: string
+    username: string
+    pin: string
+    role: 'admin' | 'user'
+  }) {
+    return catchInternal(async () => {
+      const response = await this.client.post<{
+        user: { id: number; displayName: string; username: string; role: 'admin' | 'user' }
+      }>('/auth/quick-create-user', payload)
+      return response.data
+    })()
+  }
+
+  async logout() {
+    return catchInternal(async () => {
+      const response = await this.client.post<{ success: boolean }>('/auth/logout')
+      return response.data
+    })()
+  }
+
+  async updateFamilySettings(payload: { allowMemberFamilyUploads: boolean }) {
+    return catchInternal(async () => {
+      const response = await this.client.patch<{ family: any }>('/users/family/settings', payload)
+      return response.data
     })()
   }
 
@@ -633,7 +958,8 @@ class API {
 
   async listZimFiles() {
     return catchInternal(async () => {
-      return await this.client.get<ListZimFilesResponse>('/zim/list')
+      const response = await this.client.get<ListZimFilesResponse>('/zim/list')
+      return response.data
     })()
   }
 
@@ -754,7 +1080,13 @@ class API {
     return catchInternal(async () => {
       const formData = new FormData()
       formData.append('file', file)
-      const response = await this.client.post<{ message: string; file_path: string }>(
+      const response = await this.client.post<{
+        message: string
+        file_path?: string
+        queuedFiles?: number
+        skippedFiles?: number
+        filePaths?: string[]
+      }>(
         '/rag/upload',
         formData,
         {
@@ -777,6 +1109,27 @@ class API {
     })()
   }
 
+  async getDomePlanner() {
+    return catchInternal(async () => {
+      const response = await this.client.get('/dome-planner')
+      return response.data
+    })()
+  }
+
+  async saveDomePlanner(state: any) {
+    return catchInternal(async () => {
+      const response = await this.client.put('/dome-planner', { state })
+      return response.data
+    })()
+  }
+
+  async addDomePlannerLog(entry: any) {
+    return catchInternal(async () => {
+      const response = await this.client.post('/dome-planner/log', { entry })
+      return response.data
+    })()
+  }
+
   async getDefaultSystemPrompt() {
     return catchInternal(async () => {
       const response = await this.client.get<{ prompt: string }>(
@@ -790,10 +1143,20 @@ class API {
     return catchInternal(async () => {
       const response = await this.client.patch<{ success: boolean; message: string }>(
         '/system/settings',
-        { key, value }
+        { key, value },
+        { timeout: 120_000 }
       )
       return response.data
     })()
+  }
+
+  async updateSettingStrict(key: string, value: any) {
+    const response = await this.client.patch<{ success: boolean; message: string; [key: string]: any }>(
+      '/system/settings',
+      { key, value },
+      { timeout: 120_000 }
+    )
+    return response.data
   }
 }
 

@@ -9,13 +9,20 @@ export type WorkerFlowToolName =
   | 'diagnose_home_assistant'
   | 'repair_service_from_logs'
 
-type WorkerFlowMatch =
+export type WorkerFlowMatch =
   | { tool: 'diagnose_container'; containerName: string }
   | { tool: 'patch_file_and_verify'; filePath: string; search: string; replace: string; serviceName?: string }
   | { tool: 'restart_and_verify_service'; serviceName: string }
   | { tool: 'inspect_logs_config_and_files'; containerName: string }
   | { tool: 'diagnose_home_assistant' }
   | { tool: 'repair_service_from_logs'; serviceName: string }
+
+export type WorkerFlowExecutionResult = {
+  kind: 'worker_flow_execution'
+  tool: WorkerFlowToolName
+  input: Record<string, any>
+  rawText: string
+}
 
 @inject()
 export class WorkerFlowRegistryService {
@@ -39,15 +46,17 @@ export class WorkerFlowRegistryService {
     ].join('\n')
   }
 
-  async tryHandle(userText: string): Promise<{ tool: WorkerFlowToolName; result: string } | null> {
-    const match = this.matchTool(userText)
+  async tryHandle(userText: string): Promise<WorkerFlowExecutionResult | null> {
+    const match = this.classify(userText)
     if (!match) return null
 
     const available = await this.crewAIWorkerService.isAvailable()
     if (!available) {
       return {
+        kind: 'worker_flow_execution',
         tool: match.tool,
-        result: [
+        input: { ...match },
+        rawText: [
           `Missing capability: the CrewAI worker-flow engine is not reachable right now for ${match.tool}.`,
           'Current status:',
           '- Direct deterministic tools are still available.',
@@ -59,16 +68,25 @@ export class WorkerFlowRegistryService {
     switch (match.tool) {
       case 'diagnose_container':
         return {
+          kind: 'worker_flow_execution',
           tool: match.tool,
-          result: await this.crewAIWorkerService.runTool({
+          input: { containerName: match.containerName },
+          rawText: await this.crewAIWorkerService.runTool({
             tool: 'diagnose_container',
             input: { container_name: match.containerName },
           }),
         }
       case 'patch_file_and_verify':
         return {
+          kind: 'worker_flow_execution',
           tool: match.tool,
-          result: await this.crewAIWorkerService.runTool({
+          input: {
+            filePath: match.filePath,
+            search: match.search,
+            replace: match.replace,
+            serviceName: match.serviceName,
+          },
+          rawText: await this.crewAIWorkerService.runTool({
             tool: 'patch_file_and_verify',
             input: {
               file_path: match.filePath,
@@ -80,8 +98,10 @@ export class WorkerFlowRegistryService {
         }
       case 'restart_and_verify_service':
         return {
+          kind: 'worker_flow_execution',
           tool: match.tool,
-          result: await this.crewAIWorkerService.runTool({
+          input: { serviceName: match.serviceName },
+          rawText: await this.crewAIWorkerService.runTool({
             tool: 'restart_and_verify_service',
             input: {
               service_name: match.serviceName,
@@ -90,8 +110,10 @@ export class WorkerFlowRegistryService {
         }
       case 'inspect_logs_config_and_files':
         return {
+          kind: 'worker_flow_execution',
           tool: match.tool,
-          result: await this.crewAIWorkerService.runTool({
+          input: { containerName: match.containerName },
+          rawText: await this.crewAIWorkerService.runTool({
             tool: 'inspect_logs_config_and_files',
             input: {
               container_name: match.containerName,
@@ -100,16 +122,20 @@ export class WorkerFlowRegistryService {
         }
       case 'diagnose_home_assistant':
         return {
+          kind: 'worker_flow_execution',
           tool: match.tool,
-          result: await this.crewAIWorkerService.runTool({
+          input: {},
+          rawText: await this.crewAIWorkerService.runTool({
             tool: 'diagnose_home_assistant',
             input: {},
           }),
         }
       case 'repair_service_from_logs':
         return {
+          kind: 'worker_flow_execution',
           tool: match.tool,
-          result: await this.crewAIWorkerService.runTool({
+          input: { serviceName: match.serviceName },
+          rawText: await this.crewAIWorkerService.runTool({
             tool: 'repair_service_from_logs',
             input: {
               service_name: match.serviceName,
@@ -119,6 +145,10 @@ export class WorkerFlowRegistryService {
       default:
         return null
     }
+  }
+
+  classify(userText: string): WorkerFlowMatch | null {
+    return this.matchTool(userText)
   }
 
   private matchTool(userText: string): WorkerFlowMatch | null {

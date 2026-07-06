@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { Dialog, DialogBackdrop, DialogPanel, TransitionChild } from '@headlessui/react'
 import classNames from '~/lib/classNames'
-import { IconArrowLeft, IconBug } from '@tabler/icons-react'
+import { IconBug, IconHome } from '@tabler/icons-react'
 import { Link, usePage } from '@inertiajs/react'
 import { UsePageProps } from '../../types/system'
 import { IconMenu2, IconX } from '@tabler/icons-react'
@@ -60,6 +60,11 @@ const StyledSidebar: React.FC<StyledSidebarProps> = ({ title, items }) => {
   }
 
   const Sidebar = () => {
+    const sidebarItems: SidebarItem[] = [
+      { name: 'Home', href: '/home', icon: IconHome, current: currentPath === '/home' },
+      ...items,
+    ]
+
     return (
       <div className="flex grow flex-col gap-y-5 overflow-y-auto bg-desert-sand px-6 ring-1 ring-white/5 pt-4 shadow-md">
         <div className="flex h-16 shrink-0 items-center">
@@ -70,18 +75,9 @@ const StyledSidebar: React.FC<StyledSidebarProps> = ({ title, items }) => {
           <ul role="list" className="flex flex-1 flex-col gap-y-7">
             <li>
               <ul role="list" className="-mx-2 space-y-1">
-                {items.map((item) => (
+                {sidebarItems.map((item) => (
                   <ListItem key={item.name} {...item} current={currentPath === item.href} />
                 ))}
-                <li className="ml-2 mt-4">
-                  <Link
-                    href="/home"
-                    className="flex flex-row items-center gap-x-3 text-desert-green text-sm font-semibold"
-                  >
-                    <IconArrowLeft aria-hidden="true" className="size-6 shrink-0" />
-                    Back to Home
-                  </Link>
-                </li>
               </ul>
             </li>
           </ul>

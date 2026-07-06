@@ -100,7 +100,7 @@ export class CrewAIWorkerService {
         error?: string
       }
 
-      if (status.status === 'completed' && status.result) {
+      if (status.status === 'completed' && typeof status.result === 'string') {
         return status.result.trim()
       }
       if (status.status === 'failed') {

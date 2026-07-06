@@ -13,6 +13,9 @@ interface ChatSidebarProps {
   onNewChat: () => void
   onClearHistory: () => void
   isInModal?: boolean
+  className?: string
+  onNavigate?: () => void
+  onOpenVoicePanel?: () => void
 }
 
 export default function ChatSidebar({
@@ -22,6 +25,9 @@ export default function ChatSidebar({
   onNewChat,
   onClearHistory,
   isInModal = false,
+  className,
+  onNavigate,
+  onOpenVoicePanel,
 }: ChatSidebarProps) {
   const { aiAssistantName } = usePage<{ aiAssistantName: string }>().props
   const [isKnowledgeBaseModalOpen, setIsKnowledgeBaseModalOpen] = useState(
@@ -39,8 +45,13 @@ export default function ChatSidebar({
   }
 
   return (
-    <div className="w-64 bg-surface-secondary border-r border-border-subtle flex flex-col h-full">
-      <div className="p-4 border-b border-border-subtle h-[75px] flex items-center justify-center">
+    <div
+      className={classNames(
+        'w-72 max-w-full bg-surface-secondary border-r border-border-subtle flex flex-col h-full',
+        className
+      )}
+    >
+      <div className="p-4 border-b border-border-subtle min-h-[75px] flex items-center justify-center">
         <StyledButton onClick={onNewChat} icon="IconPlus" variant="primary" fullWidth>
           New Chat
         </StyledButton>
@@ -54,7 +65,10 @@ export default function ChatSidebar({
             {sessions.map((session) => (
               <button
                 key={session.id}
-                onClick={() => onSessionSelect(session.id)}
+                onClick={() => {
+                  onSessionSelect(session.id)
+                  onNavigate?.()
+                }}
                 className={classNames(
                   'w-full text-left px-3 py-2 rounded-lg transition-colors group',
                   activeSessionId === session.id
@@ -89,7 +103,11 @@ export default function ChatSidebar({
         )}
       </div>
       <div className="p-4 flex flex-col items-center justify-center gap-y-2">
-        <img src="/project_nomad_logo.webp" alt="Project Nomad Logo" className="h-28 w-28 mb-6" />
+        <img
+          src="/project_nomad_logo.webp"
+          alt="Project Nomad Logo"
+          className="h-20 w-20 md:h-28 md:w-28 mb-3 md:mb-6"
+        />
         <StyledButton
           onClick={() => {
             if (isInModal) {
@@ -97,6 +115,7 @@ export default function ChatSidebar({
             } else {
               router.visit('/home')
             }
+            onNavigate?.()
           }}
           icon={isInModal ? 'IconExternalLink' : 'IconHome'}
           variant="outline"
@@ -107,7 +126,20 @@ export default function ChatSidebar({
         </StyledButton>
         <StyledButton
           onClick={() => {
+            onOpenVoicePanel?.()
+            onNavigate?.()
+          }}
+          icon="IconWand"
+          variant="primary"
+          size="sm"
+          fullWidth
+        >
+          Voice
+        </StyledButton>
+        <StyledButton
+          onClick={() => {
             router.visit('/settings/models')
+            onNavigate?.()
           }}
           icon="IconDatabase"
           variant="primary"
@@ -119,6 +151,7 @@ export default function ChatSidebar({
         <StyledButton
           onClick={() => {
             setIsKnowledgeBaseModalOpen(true)
+            onNavigate?.()
           }}
           icon="IconBrain"
           variant="primary"

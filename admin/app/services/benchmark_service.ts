@@ -355,7 +355,7 @@ export class BenchmarkService {
       }
 
       if (type === 'full' || type === 'system') {
-        systemScores = await this._runSystemBenchmarks()
+        systemScores = await this._runSystemBenchmarks(hardware)
       }
 
       // Run AI benchmark if requested and Ollama is available
@@ -414,17 +414,17 @@ export class BenchmarkService {
   /**
    * Run system benchmarks using sysbench in Docker
    */
-  private async _runSystemBenchmarks(): Promise<SystemScores> {
+  private async _runSystemBenchmarks(hardware: HardwareInfo): Promise<SystemScores> {
     // Ensure sysbench image is available
     await this._ensureSysbenchImage()
 
     // Run CPU benchmark
     this._updateStatus('running_cpu', 'Running CPU benchmark...')
-    const cpuResult = await this._runSysbenchCpu()
+    const cpuResult = await this._runSysbenchCpu(hardware.cpu_threads)
 
     // Run memory benchmark
     this._updateStatus('running_memory', 'Running memory benchmark...')
-    const memoryResult = await this._runSysbenchMemory()
+    const memoryResult = await this._runSysbenchMemory(hardware.cpu_threads)
 
     // Run disk benchmarks
     this._updateStatus('running_disk_read', 'Running disk read benchmark...')
@@ -590,6 +590,18 @@ export class BenchmarkService {
   }
 
   /**
+   * Scale sysbench thread count to the detected logical CPU capacity instead of
+   * the old fixed 4-thread limit, which understated larger systems badly.
+   */
+  private _resolveSysbenchThreadCount(cpuThreads: number): number {
+    if (!Number.isFinite(cpuThreads) || cpuThreads <= 0) {
+      return 4
+    }
+
+    return Math.max(4, Math.floor(cpuThreads))
+  }
+
+  /**
    * Ensure sysbench Docker image is available
    */
   private async _ensureSysbenchImage(): Promise<void> {
@@ -605,12 +617,13 @@ export class BenchmarkService {
   /**
    * Run sysbench CPU benchmark
    */
-  private async _runSysbenchCpu(): Promise<SysbenchCpuResult> {
+  private async _runSysbenchCpu(cpuThreads: number): Promise<SysbenchCpuResult> {
+    const threads = this._resolveSysbenchThreadCount(cpuThreads)
     const output = await this._runSysbenchCommand([
       'sysbench',
       'cpu',
       '--cpu-max-prime=20000',
-      '--threads=4',
+      `--threads=${threads}`,
       '--time=30',
       'run',
     ])
@@ -631,13 +644,14 @@ export class BenchmarkService {
   /**
    * Run sysbench memory benchmark
    */
-  private async _runSysbenchMemory(): Promise<SysbenchMemoryResult> {
+  private async _runSysbenchMemory(cpuThreads: number): Promise<SysbenchMemoryResult> {
+    const threads = this._resolveSysbenchThreadCount(cpuThreads)
     const output = await this._runSysbenchCommand([
       'sysbench',
       'memory',
       '--memory-block-size=1K',
       '--memory-total-size=10G',
-      '--threads=4',
+      `--threads=${threads}`,
       'run',
     ])
 

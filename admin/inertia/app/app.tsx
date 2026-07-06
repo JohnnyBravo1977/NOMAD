@@ -16,6 +16,10 @@ import { UsePageProps } from '../../types/system'
 
 const appName = import.meta.env.VITE_APP_NAME || 'Project N.O.M.A.D.'
 const queryClient = new QueryClient()
+const SERVICE_WORKER_PATH = '/service-worker.js'
+
+const LOCKED_VIEWPORT_CONTENT =
+  'width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, shrink-to-fit=no, viewport-fit=cover, interactive-widget=resizes-content'
 
 // Patch the global crypto object for non-HTTPS/localhost contexts
 if (!window.crypto?.randomUUID) {
@@ -23,6 +27,30 @@ if (!window.crypto?.randomUUID) {
   if (!window.crypto) window.crypto = {}
   // @ts-ignore
   window.crypto.randomUUID = generateUUID
+}
+
+const enforceLockedViewport = () => {
+  const viewportMeta = document.querySelector('meta[name="viewport"]')
+  if (!viewportMeta) return
+
+  if (viewportMeta.getAttribute('content') !== LOCKED_VIEWPORT_CONTENT) {
+    viewportMeta.setAttribute('content', LOCKED_VIEWPORT_CONTENT)
+  }
+}
+
+enforceLockedViewport()
+window.addEventListener('focusin', enforceLockedViewport)
+window.addEventListener('focusout', enforceLockedViewport)
+window.addEventListener('resize', enforceLockedViewport)
+window.addEventListener('orientationchange', enforceLockedViewport)
+window.visualViewport?.addEventListener('resize', enforceLockedViewport)
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register(SERVICE_WORKER_PATH).catch((error) => {
+      console.warn('NOMAD service worker registration failed:', error)
+    })
+  })
 }
 
 createInertiaApp({

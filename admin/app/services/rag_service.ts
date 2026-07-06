@@ -4,7 +4,7 @@ import { inject } from '@adonisjs/core'
 import logger from '@adonisjs/core/services/logger'
 import { TokenChunker } from '@chonkiejs/core'
 import sharp from 'sharp'
-import { deleteFileIfExists, determineFileType, getFile, getFileStatsIfExists, listDirectoryContentsRecursive, ZIM_STORAGE_PATH } from '../utils/fs.js'
+import { deleteFileIfExists, determineFileType, getFile, getFileStatsIfExists, listDirectoryContentsRecursive, sanitizeFilename, ZIM_STORAGE_PATH } from '../utils/fs.js'
 import { doResumableDownloadWithRetry } from '../utils/downloads.js'
 import { PDFParse } from 'pdf-parse'
 import { createWorker } from 'tesseract.js'
@@ -15,14 +15,22 @@ import { OllamaService } from './ollama_service.js'
 import { SERVICE_NAMES } from '../../constants/service_names.js'
 import { removeStopwords } from 'stopword'
 import { randomUUID } from 'node:crypto'
-import { join, resolve, sep } from 'node:path'
+import { dirname, join, resolve, sep } from 'node:path'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
 import KVStore from '#models/kv_store'
+import LibraryItem from '#models/library_item'
+import Family from '#models/family'
+import User from '#models/user'
 import { ZIMExtractionService } from './zim_extraction_service.js'
 import { ZIM_BATCH_SIZE } from '../../constants/zim_extraction.js'
 import { ProcessAndEmbedFileResponse, ProcessZIMFileResponse, RAGResult, RerankedRAGResult } from '../../types/rag.js'
+import type { NomadUserSpace } from '#services/user_space_service'
+import { UserSpaceContextService } from '#services/user_space_context_service'
 
 @inject()
 export class RagService {
+  private static ZIP_MAX_EXTRACTED_FILES = 250
+  private static ZIP_MAX_TOTAL_BYTES = 500 * 1024 * 1024
   private qdrant: QdrantClient | null = null
   private qdrantInitPromise: Promise<void> | null = null
   private embeddingModelVerified = false
@@ -52,6 +60,48 @@ export class RagService {
     private ollamaService: OllamaService
   ) { }
 
+  private resolveUserSpace(userSpace?: NomadUserSpace | null): NomadUserSpace | null {
+    return userSpace || UserSpaceContextService.get()
+  }
+
+  private async filterAccessibleUploadSources(
+    sources: string[],
+    userSpace?: NomadUserSpace | null
+  ): Promise<string[]> {
+    const viewer = this.resolveUserSpace(userSpace)
+    if (!viewer || sources.length === 0) return sources
+
+    const uploadSources = sources.filter((source) => this.isUploadedKbSource(source))
+    const publicSources = sources.filter((source) => !this.isUploadedKbSource(source))
+
+    if (uploadSources.length === 0) return publicSources
+
+    const libraryItems = await LibraryItem.query().whereIn('source', uploadSources)
+    const allowedUploadSources = libraryItems
+      .filter((item) => {
+        if (item.scope === 'user_private') {
+          return item.owner_user_id === viewer.user.id
+        }
+
+        return (
+          item.scope === 'family_shared' &&
+          item.family_id === viewer.family.id &&
+          item.status === 'approved'
+        )
+      })
+      .map((item) => item.source)
+
+    return [...publicSources, ...allowedUploadSources]
+  }
+
+  private async isSourceAccessible(
+    source: string,
+    userSpace?: NomadUserSpace | null
+  ): Promise<boolean> {
+    const allowed = await this.filterAccessibleUploadSources([source], userSpace)
+    return allowed.includes(source)
+  }
+
   private async _initializeQdrantClient() {
     if (!this.qdrantInitPromise) {
       this.qdrantInitPromise = (async () => {
@@ -78,6 +128,188 @@ export class RagService {
       return true
     }
     return false
+  }
+
+  private isArchiveMetadataPath(entryName: string): boolean {
+    const normalized = entryName.replace(/\\/g, '/')
+    return (
+      normalized.startsWith('__MACOSX/') ||
+      normalized.endsWith('/.ds_store') ||
+      normalized.endsWith('/thumbs.db') ||
+      normalized.endsWith('/desktop.ini') ||
+      normalized === '.ds_store' ||
+      normalized === 'thumbs.db' ||
+      normalized === 'desktop.ini'
+    )
+  }
+
+  private sanitizeArchiveRelativePath(entryName: string): string {
+    const segments = entryName
+      .replace(/\\/g, '/')
+      .split('/')
+      .map((segment) => sanitizeFilename(segment))
+      .filter(Boolean)
+
+    return segments.join('/')
+  }
+
+  private buildStoredUploadFileName(originalName: string): string {
+    const randomSuffix = randomUUID().replace(/-/g, '').slice(0, 12)
+    const sanitizedName = sanitizeFilename(originalName)
+    const lastDot = sanitizedName.lastIndexOf('.')
+    const hasExtension = lastDot > 0 && lastDot < sanitizedName.length - 1
+
+    if (!hasExtension) {
+      return `${sanitizedName}-${randomSuffix}`
+    }
+
+    const base = sanitizedName.slice(0, lastDot)
+    const ext = sanitizedName.slice(lastDot)
+    return `${base}-${randomSuffix}${ext}`
+  }
+
+  public async importZipUpload(
+    zipFilePath: string,
+    clientName: string,
+    scope: 'user_private' | 'family_shared',
+    userSpace: NomadUserSpace
+  ): Promise<{
+    success: boolean
+    message: string
+    queuedFiles: number
+    skippedFiles: number
+    filePaths: string[]
+  }> {
+    const zipBuffer = await getFile(zipFilePath, 'buffer')
+    if (!zipBuffer) {
+      return {
+        success: false,
+        message: 'Failed to read the uploaded ZIP file.',
+        queuedFiles: 0,
+        skippedFiles: 0,
+        filePaths: [],
+      }
+    }
+
+    const zip = await JSZip.loadAsync(zipBuffer)
+    const storageSegments =
+      scope === 'family_shared'
+        ? ['families', userSpace.family.slug, 'shared']
+        : ['users', userSpace.user.slug]
+    const archiveFolderName = this.buildStoredUploadFileName(clientName.replace(/\.zip$/i, ''))
+    const storagePath = join(RagService.UPLOADS_STORAGE_PATH, ...storageSegments, archiveFolderName)
+    const absoluteStoragePath = join(process.cwd(), storagePath)
+    await mkdir(absoluteStoragePath, { recursive: true })
+
+    const queuedFilePaths: string[] = []
+    const queuedJobFilePaths: string[] = []
+    let skippedFiles = 0
+    let extractedBytes = 0
+
+    try {
+      const entries = Object.values(zip.files)
+      for (const entry of entries) {
+        if (entry.dir || this.isArchiveMetadataPath(entry.name)) {
+          continue
+        }
+
+        const sanitizedRelativePath = this.sanitizeArchiveRelativePath(entry.name)
+        if (!sanitizedRelativePath) {
+          skippedFiles++
+          continue
+        }
+
+        const fileType = determineFileType(sanitizedRelativePath)
+        if (fileType === 'unknown' || fileType === 'zim') {
+          skippedFiles++
+          continue
+        }
+
+        if (queuedFilePaths.length >= RagService.ZIP_MAX_EXTRACTED_FILES) {
+          throw new Error(
+            `ZIP archives can contain at most ${RagService.ZIP_MAX_EXTRACTED_FILES} supported files.`
+          )
+        }
+
+        const fileBuffer = await entry.async('nodebuffer')
+        extractedBytes += fileBuffer.byteLength
+        if (extractedBytes > RagService.ZIP_MAX_TOTAL_BYTES) {
+          throw new Error('ZIP archive is too large after extraction.')
+        }
+
+        const storedFileName = this.buildStoredUploadFileName(sanitizedRelativePath)
+        const fullPath = join(absoluteStoragePath, storedFileName)
+        await mkdir(dirname(fullPath), { recursive: true })
+        await writeFile(fullPath, fileBuffer)
+
+        await LibraryItem.create({
+          source: fullPath,
+          storage_path: storagePath,
+          display_name: `${clientName.replace(/\.zip$/i, '')}/${entry.name.replace(/\\/g, '/')}`,
+          scope,
+          status: 'approved',
+          family_id: userSpace.family.id,
+          owner_user_id: scope === 'user_private' ? userSpace.user.id : null,
+          uploaded_by_user_id: userSpace.user.id,
+          approved_by_user_id: scope === 'family_shared' && userSpace.canAccessAdminTools ? userSpace.user.id : null,
+        })
+
+        queuedFilePaths.push(fullPath)
+      }
+
+      if (queuedFilePaths.length === 0) {
+        await rm(absoluteStoragePath, { recursive: true, force: true }).catch(() => {})
+        return {
+          success: false,
+          message: 'ZIP archive did not contain any supported documents or images.',
+          queuedFiles: 0,
+          skippedFiles,
+          filePaths: [],
+        }
+      }
+
+      const { EmbedFileJob } = await import('#jobs/embed_file_job')
+      for (const filePath of queuedFilePaths) {
+        const fileName = filePath.split(/[/\\]/).pop() || filePath
+        await EmbedFileJob.dispatch({ filePath, fileName })
+        queuedJobFilePaths.push(filePath)
+      }
+
+      return {
+        success: true,
+        message: `Queued ${queuedFilePaths.length} file${queuedFilePaths.length === 1 ? '' : 's'} from ${clientName}${skippedFiles > 0 ? ` and skipped ${skippedFiles} unsupported file${skippedFiles === 1 ? '' : 's'}` : ''}.`,
+        queuedFiles: queuedFilePaths.length,
+        skippedFiles,
+        filePaths: queuedFilePaths,
+      }
+    } catch (error) {
+      const { EmbedFileJob } = await import('#jobs/embed_file_job')
+      await Promise.all(
+        queuedJobFilePaths.map(async (filePath) => {
+          const job = await EmbedFileJob.getByFilePath(filePath)
+          if (job) {
+            await job.remove().catch(() => {})
+          }
+        })
+      )
+      await Promise.all(
+        queuedFilePaths.map(async (filePath) => {
+          await LibraryItem.query().where('source', filePath).delete()
+          await deleteFileIfExists(filePath)
+        })
+      )
+      await rm(absoluteStoragePath, { recursive: true, force: true }).catch(() => {})
+      if (error instanceof Error) {
+        return {
+          success: false,
+          message: error.message,
+          queuedFiles: 0,
+          skippedFiles,
+          filePaths: [],
+        }
+      }
+      throw error
+    }
   }
 
   private async _ensureCollection(
@@ -905,7 +1137,8 @@ export class RagService {
   public async searchSimilarDocuments(
     query: string,
     limit: number = 5,
-    scoreThreshold: number = 0.3 // Lower default threshold - was 0.7, now 0.3
+    scoreThreshold: number = 0.3, // Lower default threshold - was 0.7, now 0.3
+    userSpace?: NomadUserSpace | null
   ): Promise<Array<{ text: string; score: number; metadata?: Record<string, any> }>> {
     try {
       logger.debug(`[RAG] Starting similarity search for query: "${query}"`)
@@ -999,7 +1232,18 @@ export class RagService {
         source: result.payload?.source as string | undefined,
       }))
 
-      const rerankedResults = this.rerankResults(resultsWithMetadata, keywords, query)
+      const accessibleSources = await this.filterAccessibleUploadSources(
+        resultsWithMetadata.map((result) => result.source).filter((value): value is string => !!value),
+        userSpace
+      )
+
+      const filteredResults = resultsWithMetadata.filter((result) => {
+        if (!result.source) return true
+        if (!this.isUploadedKbSource(result.source)) return true
+        return accessibleSources.includes(result.source)
+      })
+
+      const rerankedResults = this.rerankResults(filteredResults, keywords, query)
 
       logger.debug(`[RAG] Top 3 results after reranking:`)
       rerankedResults.slice(0, 3).forEach((result, idx) => {
@@ -1162,7 +1406,7 @@ export class RagService {
    * Retrieve all unique source files that have been stored in the knowledge base.
    * @returns Array of unique full source paths
    */
-  public async getStoredFiles(): Promise<string[]> {
+  public async getStoredFiles(userSpace?: NomadUserSpace | null): Promise<string[]> {
     try {
       await this._ensureCollection(
         RagService.CONTENT_COLLECTION_NAME,
@@ -1193,7 +1437,7 @@ export class RagService {
         offset = scrollResult.next_page_offset || null
       } while (offset !== null)
 
-      return Array.from(sources)
+      return this.filterAccessibleUploadSources(Array.from(sources), userSpace)
     } catch (error) {
       logger.error('Error retrieving stored files:', error)
       return []
@@ -1305,26 +1549,40 @@ export class RagService {
     return ranked.slice(0, limit).map((item) => item.source)
   }
 
-  public async getStoredFileDisplayNames(extension?: string): Promise<string[]> {
-    const files = await this.getStoredFiles()
+  public async getStoredFileDisplayNames(
+    extension?: string,
+    userSpace?: NomadUserSpace | null
+  ): Promise<string[]> {
+    const files = await this.getStoredFiles(userSpace)
     return this.listDisplayNamesForSources(files, extension)
   }
 
-  public async getUploadedFileDisplayNames(extension?: string): Promise<string[]> {
-    const files = await this.getStoredFiles()
+  public async getUploadedFileDisplayNames(
+    extension?: string,
+    userSpace?: NomadUserSpace | null
+  ): Promise<string[]> {
+    const files = await this.getStoredFiles(userSpace)
     return this.listDisplayNamesForSources(
       files.filter((source) => this.isUploadedKbSource(source)),
       extension
     )
   }
 
-  public async findStoredFilesByQuery(query: string, limit: number = 3): Promise<string[]> {
-    const files = await this.getStoredFiles()
+  public async findStoredFilesByQuery(
+    query: string,
+    limit: number = 3,
+    userSpace?: NomadUserSpace | null
+  ): Promise<string[]> {
+    const files = await this.getStoredFiles(userSpace)
     return this.rankStoredFilesByQuery(files, query, limit)
   }
 
-  public async findUploadedFilesByQuery(query: string, limit: number = 3): Promise<string[]> {
-    const files = await this.getStoredFiles()
+  public async findUploadedFilesByQuery(
+    query: string,
+    limit: number = 3,
+    userSpace?: NomadUserSpace | null
+  ): Promise<string[]> {
+    const files = await this.getStoredFiles(userSpace)
     return this.rankStoredFilesByQuery(
       files.filter((source) => this.isUploadedKbSource(source)),
       query,
@@ -1332,11 +1590,21 @@ export class RagService {
     )
   }
 
+  public async getUploadedStoredFiles(userSpace?: NomadUserSpace | null): Promise<string[]> {
+    const files = await this.getStoredFiles(userSpace)
+    return files.filter((source) => this.isUploadedKbSource(source))
+  }
+
   public async getDocumentsBySource(
     source: string,
-    limit: number = 5
+    limit: number = 5,
+    userSpace?: NomadUserSpace | null
   ): Promise<Array<{ text: string; score: number; metadata?: Record<string, any> }>> {
     try {
+      if (!(await this.isSourceAccessible(source, userSpace))) {
+        return []
+      }
+
       await this._ensureCollection(
         RagService.CONTENT_COLLECTION_NAME,
         RagService.EMBEDDING_DIMENSION
@@ -1384,8 +1652,25 @@ export class RagService {
    * the corresponding file from disk if it lives under the uploads directory.
    * @param source - Full source path as stored in Qdrant payloads
    */
-  public async deleteFileBySource(source: string): Promise<{ success: boolean; message: string }> {
+  public async deleteFileBySource(
+    source: string,
+    userSpace?: NomadUserSpace | null
+  ): Promise<{ success: boolean; message: string }> {
     try {
+      const viewer = this.resolveUserSpace(userSpace)
+      const libraryItem = await LibraryItem.query().where('source', source).first()
+      if (libraryItem) {
+        const canDelete =
+          (libraryItem.scope === 'user_private' && viewer?.user.id === libraryItem.owner_user_id) ||
+          (libraryItem.scope === 'family_shared' && !!viewer?.canAccessAdminTools)
+
+        if (!canDelete) {
+          return { success: false, message: 'You do not have permission to remove that file.' }
+        }
+      } else {
+        return { success: false, message: 'Only uploaded library files can be removed here.' }
+      }
+
       await this._ensureCollection(
         RagService.CONTENT_COLLECTION_NAME,
         RagService.EMBEDDING_DIMENSION
@@ -1411,6 +1696,10 @@ export class RagService {
         logger.info(`[RAG] Deleted uploaded file from disk: ${resolvedSource}`)
       } else {
         logger.warn(`[RAG] File was removed from knowledge base but doesn't live in Nomad's uploads directory, so it can't be safely removed. Skipping deletion of physical file...`)
+      }
+
+      if (libraryItem) {
+        await libraryItem.delete()
       }
 
       return { success: true, message: 'File removed from knowledge base.' }
@@ -1542,6 +1831,11 @@ export class RagService {
 
       logger.info(`[RAG] Found ${filesInStorage.length} total files in storage directories`)
 
+      const metadataBackfilled = await this.backfillLegacyLibraryItems(filesInStorage)
+      if (metadataBackfilled > 0) {
+        logger.info(`[RAG] Backfilled ${metadataBackfilled} legacy library item records`)
+      }
+
       // Get all stored sources from Qdrant
       await this._ensureCollection(
         RagService.CONTENT_COLLECTION_NAME,
@@ -1613,7 +1907,7 @@ export class RagService {
 
       return {
         success: true,
-        message: `Scanned ${filesInStorage.length} files, queued ${queuedCount} for embedding`,
+        message: `Scanned ${filesInStorage.length} files, queued ${queuedCount} for embedding${metadataBackfilled > 0 ? `, backfilled ${metadataBackfilled} library records` : ''}`,
         filesScanned: filesInStorage.length,
         filesQueued: queuedCount,
       }
@@ -1624,5 +1918,72 @@ export class RagService {
         message: 'Error scanning and syncing knowledge base',
       }
     }
+  }
+
+  private async backfillLegacyLibraryItems(filesInStorage: string[]): Promise<number> {
+    const kbPrefix = join(process.cwd(), RagService.UPLOADS_STORAGE_PATH).replace(/\\/g, '/')
+    const legacyUploadFiles = filesInStorage.filter((filePath) => {
+      const normalized = filePath.replace(/\\/g, '/')
+      if (!normalized.startsWith(kbPrefix)) return false
+      if (normalized.includes('/family-profiles/')) return false
+      return true
+    })
+
+    if (legacyUploadFiles.length === 0) {
+      return 0
+    }
+
+    const existingItems = await LibraryItem.query().whereIn('source', legacyUploadFiles)
+    const existingSources = new Set(existingItems.map((item) => item.source))
+    const missingSources = legacyUploadFiles.filter((source) => !existingSources.has(source))
+
+    if (missingSources.length === 0) {
+      return 0
+    }
+
+    const family = await Family.query().orderBy('id', 'asc').first()
+    const adminUser = await User.query().where('role', 'admin').orderBy('id', 'asc').first()
+
+    if (!family || !adminUser) {
+      logger.warn('[RAG] Could not backfill legacy library items because no family/admin user exists yet.')
+      return 0
+    }
+
+    for (const source of missingSources) {
+      const normalized = source.replace(/\\/g, '/')
+      const displayName = this.sourceToDisplayName(source)
+
+      let scope: 'user_private' | 'family_shared' = 'family_shared'
+      let ownerUserId: number | null = null
+      let storagePath = RagService.UPLOADS_STORAGE_PATH
+
+      const userMatch = normalized.match(/\/storage\/kb_uploads\/users\/([^/]+)\//i)
+      const familySharedMatch = normalized.match(/\/storage\/kb_uploads\/families\/([^/]+)\/shared\//i)
+
+      if (userMatch) {
+        const owner = await User.query().where('slug', userMatch[1]).first()
+        if (owner) {
+          scope = 'user_private'
+          ownerUserId = owner.id
+          storagePath = join(RagService.UPLOADS_STORAGE_PATH, 'users', owner.slug)
+        }
+      } else if (familySharedMatch) {
+        storagePath = join(RagService.UPLOADS_STORAGE_PATH, 'families', familySharedMatch[1], 'shared')
+      }
+
+      await LibraryItem.create({
+        source,
+        storage_path: storagePath,
+        display_name: displayName,
+        scope,
+        status: 'approved',
+        family_id: family.id,
+        owner_user_id: ownerUserId,
+        uploaded_by_user_id: adminUser.id,
+        approved_by_user_id: adminUser.id,
+      })
+    }
+
+    return missingSources.length
   }
 }

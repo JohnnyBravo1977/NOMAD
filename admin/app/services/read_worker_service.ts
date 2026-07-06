@@ -1,12 +1,13 @@
 import { inject } from '@adonisjs/core'
 import { DockerService } from '#services/docker_service'
 import { readFile, readdir, stat } from 'fs/promises'
+import env from '#start/env'
 import path from 'node:path'
 
 type ReadTask =
   | { kind: 'list_containers' }
   | { kind: 'inspect_container'; containerName: string }
-  | { kind: 'tail_container_logs'; containerName: string }
+  | { kind: 'tail_container_logs'; containerName: string; filter?: 'all' | 'errors' }
   | { kind: 'read_file'; filePath: string }
   | { kind: 'list_directory'; dirPath: string }
   | { kind: 'inspect_path'; targetPath: string }
@@ -18,6 +19,7 @@ type ReadTask =
 const ALLOWED_READ_ROOTS = [
   '/app',
   '/tmp',
+  '/home/nomad',
 ]
 const MAX_FILE_BYTES = 64 * 1024
 const MAX_SEARCH_RESULTS = 12
@@ -33,6 +35,7 @@ export class ReadWorkerService {
       '- List Docker containers',
       '- Inspect Docker containers by name',
       '- Read recent container logs',
+      '- Hand off to Dozzle for deeper live container log inspection when available',
       '- Read text files under /app and /tmp',
       '- List directories under /app and /tmp',
       '- Inspect the local app workspace',
@@ -46,7 +49,7 @@ export class ReadWorkerService {
   }
 
   async tryHandle(userText: string): Promise<string | null> {
-    const task = this.parseTask(userText)
+    const task = this.classify(userText)
     if (!task) return null
 
     switch (task.kind) {
@@ -55,7 +58,7 @@ export class ReadWorkerService {
       case 'inspect_container':
         return this.inspectContainer(task.containerName)
       case 'tail_container_logs':
-        return this.tailContainerLogs(task.containerName)
+        return this.tailContainerLogs(task.containerName, task.filter || 'all')
       case 'read_file':
         return this.readTextFile(task.filePath)
       case 'list_directory':
@@ -75,6 +78,10 @@ export class ReadWorkerService {
     }
   }
 
+  classify(userText: string): ReadTask | null {
+    return this.parseTask(userText)
+  }
+
   private parseTask(userText: string): ReadTask | null {
     const text = userText.trim()
 
@@ -90,19 +97,23 @@ export class ReadWorkerService {
     }
 
     let match =
-      text.match(/\b(?:inspect|check|look at|show)\s+(?:the\s+)?container\s+([a-zA-Z0-9._-]+)/i) ||
-      text.match(/\b(?:inspect|check|look at|show)\s+(?:the\s+)?([a-zA-Z0-9._-]+)\s+container\b/i) ||
-      text.match(/\b(?:inspect|check|look at|show)\s+([a-zA-Z0-9._-]+)\s+container\b/i)
+      text.match(/\b(?:inspect|check|look at|show)\s+(?:the\s+)?container\s+([a-zA-Z0-9._-]+)/i)
     if (match) {
       return { kind: 'inspect_container', containerName: match[1] }
     }
 
     match =
+      text.match(/\b(?:recent|latest|current)\s+logs(?:\s+for|\s+of)?\s+([a-zA-Z0-9._-]+)/i) ||
+      text.match(/\binspect\s+recent\s+logs(?:\s+for|\s+of)?\s+([a-zA-Z0-9._-]+)/i) ||
+      text.match(/\bwhat\s+(?:errors|warnings)\s+(?:are\s+in|do\s+you\s+see\s+in)\s+([a-zA-Z0-9._-]+)\s+logs\b/i) ||
       text.match(/\b(?:show|tail|read|inspect|check)\s+(?:the\s+)?logs(?:\s+for|\s+of)?\s+([a-zA-Z0-9._-]+)/i) ||
-      text.match(/\b(?:show|tail|read|inspect|check)\s+(?:the\s+)?([a-zA-Z0-9._-]+)\s+logs\b/i) ||
-      text.match(/\b([a-zA-Z0-9._-]+)\s+logs\b/i)
+      text.match(/\b(?:show|tail|read|inspect|check)\s+(?:the\s+)?([a-zA-Z0-9._-]+)\s+logs\b/i)
     if (match) {
-      return { kind: 'tail_container_logs', containerName: match[1] }
+      return {
+        kind: 'tail_container_logs',
+        containerName: match[1],
+        filter: /\b(?:errors|warnings)\b/i.test(text) ? 'errors' : 'all',
+      }
     }
 
     match =
@@ -185,9 +196,8 @@ export class ReadWorkerService {
       })
 
     const parts = [
-      `I checked the current Docker containers.`,
-      `${running.length} running, ${others.length} not running.`,
-      `Here is what I found:\n${lines.join('\n')}`,
+      `Here's the current Docker picture: ${running.length} running, ${others.length} not running.`,
+      lines.join('\n'),
     ]
     if (others.length > 0) {
       parts.push(`I left out ${others.length} non-running container${others.length === 1 ? '' : 's'} to keep this readable.`)
@@ -216,18 +226,14 @@ export class ReadWorkerService {
       .map((mount) => `${mount.Source} -> ${mount.Destination}`)
       .slice(0, 6)
 
-    const lines = [
-      `I checked the ${containerName} container.`,
-      `It is currently ${state}.`,
-      `Image: ${image}`,
-    ]
+    const lines = [`${containerName} is currently ${state}.`, `Image: ${image}`]
     if (ports.length > 0) lines.push(`Ports: ${ports.join(', ')}`)
     if (mounts.length > 0) lines.push(`Mounts: ${mounts.join('; ')}`)
 
     return lines.join('\n')
   }
 
-  async tailContainerLogs(containerName: string): Promise<string> {
+  async tailContainerLogs(containerName: string, filter: 'all' | 'errors' = 'all'): Promise<string> {
     const container = await this.resolveContainer(containerName)
     if (!container) {
       return `I couldn't find a container named ${containerName}.`
@@ -245,11 +251,35 @@ export class ReadWorkerService {
       .filter(Boolean)
       .slice(-20)
 
-    if (cleaned.length === 0) {
+    const resolvedName = container.Names?.[0]?.replace(/^\//, '') || containerName
+    const visibleLines =
+      filter === 'errors'
+        ? cleaned.filter((line) => /\b(?:error|warn|warning|fatal|exception|failed)\b/i.test(line))
+        : cleaned
+    const dozzleHint = this.buildDozzleHint(resolvedName)
+
+    if (visibleLines.length === 0) {
+      if (filter === 'errors') {
+        return [
+          `I checked ${resolvedName}, but I didn't find any recent error or warning lines.`,
+          dozzleHint,
+        ]
+          .filter(Boolean)
+          .join('\n\n')
+      }
+
       return `I checked ${containerName}, but there weren't any recent logs to show.`
     }
 
-    return `I pulled the latest logs from ${containerName}. Here are the newest lines:\n${cleaned.join('\n')}`
+    return [
+      filter === 'errors'
+        ? `I checked the recent error and warning lines from ${resolvedName}. Here are the newest matches:`
+        : `I pulled the latest logs from ${resolvedName}. Here are the newest lines:`,
+      visibleLines.join('\n'),
+      dozzleHint,
+    ]
+      .filter(Boolean)
+      .join('\n\n')
   }
 
   async readTextFile(filePath: string): Promise<string> {
@@ -575,6 +605,29 @@ export class ReadWorkerService {
       return true
     })
     return total
+  }
+
+  private buildDozzleHint(containerName: string): string | null {
+    const dozzleUrl = this.getDozzleUrl()
+    if (!dozzleUrl) return null
+
+    return [
+      `For deeper live logs, open Dozzle at ${dozzleUrl}.`,
+      `Then select ${containerName}.`,
+    ].join(' ')
+  }
+
+  private getDozzleUrl(): string | null {
+    try {
+      const baseUrl = new URL(env.get('URL'))
+      baseUrl.port = '9999'
+      baseUrl.pathname = '/'
+      baseUrl.search = ''
+      baseUrl.hash = ''
+      return baseUrl.toString().replace(/\/$/, '')
+    } catch {
+      return null
+    }
   }
 }
 

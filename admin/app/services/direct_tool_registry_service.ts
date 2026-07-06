@@ -1,4 +1,5 @@
 import { inject } from '@adonisjs/core'
+import { DesktopShortcutService } from '#services/desktop_shortcut_service'
 import { EditWorkerService } from '#services/edit_worker_service'
 import { ReadWorkerService } from '#services/read_worker_service'
 import { TerminalWorkerService } from '#services/terminal_worker_service'
@@ -11,9 +12,10 @@ export type DirectToolName =
   | 'write_file'
   | 'edit_file'
   | 'create_shortcut'
+  | 'remove_shortcut'
   | 'run_safe_command'
 
-type DirectToolMatch =
+export type DirectToolMatch =
   | { tool: 'list_containers' }
   | { tool: 'inspect_docker_container'; containerName: string }
   | { tool: 'inspect_files'; filePath: string }
@@ -21,14 +23,33 @@ type DirectToolMatch =
   | { tool: 'write_file'; filePath: string; content: string }
   | { tool: 'edit_file'; filePath: string; search: string; replace: string }
   | { tool: 'create_shortcut'; targetName: string }
-  | { tool: 'run_safe_command'; command: string }
+  | { tool: 'remove_shortcut'; targetName: string }
+  | {
+      tool: 'run_safe_command'
+      command: string
+      target?: 'runtime' | 'host_user'
+      source?: 'shell_request' | 'sidebar_request'
+      explicitlyAllowsPrivilegeChanges?: boolean
+      brokerAction?: {
+        action: string
+        params: Record<string, string>
+      }
+    }
+
+export type DirectToolExecutionResult = {
+  kind: 'direct_tool_execution'
+  tool: DirectToolName
+  input: Record<string, any>
+  rawText: string
+}
 
 @inject()
 export class DirectToolRegistryService {
   constructor(
     private readWorkerService: ReadWorkerService,
     private editWorkerService: EditWorkerService,
-    private terminalWorkerService: TerminalWorkerService
+    private terminalWorkerService: TerminalWorkerService,
+    private desktopShortcutService: DesktopShortcutService
   ) {}
 
   describeTools(): string {
@@ -41,57 +62,132 @@ export class DirectToolRegistryService {
       '- write_file',
       '- edit_file',
       '- create_shortcut',
+      '- remove_shortcut',
       '- run_safe_command',
       'Direct tool limits:',
       '- Direct tools perform one bounded action at a time and return a deterministic result.',
-      '- create_shortcut is currently capability-gated and does not write to the host Desktop.',
+      '- create_shortcut writes only approved launchers to the Desktop bridge.',
       '- File reads are limited to allowed read roots, and file writes are limited to allowed write roots.',
       '- run_safe_command stays inside the current runtime and blocks destructive or system-admin commands.',
     ].join('\n')
   }
 
-  async tryHandle(userText: string): Promise<{ tool: DirectToolName; result: string } | null> {
-    const match = this.matchTool(userText)
+  async tryHandle(userText: string): Promise<DirectToolExecutionResult | null> {
+    const match = this.classify(userText)
     if (!match) return null
 
     switch (match.tool) {
       case 'list_containers':
-        return { tool: match.tool, result: await this.readWorkerService.listContainers() }
+        return {
+          kind: 'direct_tool_execution',
+          tool: match.tool,
+          input: {},
+          rawText: await this.readWorkerService.listContainers(),
+        }
       case 'inspect_docker_container':
-        return { tool: match.tool, result: await this.readWorkerService.inspectContainer(match.containerName) }
+        return {
+          kind: 'direct_tool_execution',
+          tool: match.tool,
+          input: { containerName: match.containerName },
+          rawText: await this.readWorkerService.inspectContainer(match.containerName),
+        }
       case 'inspect_files':
-        return { tool: match.tool, result: await this.readWorkerService.inspectPath(match.filePath) }
+        return {
+          kind: 'direct_tool_execution',
+          tool: match.tool,
+          input: { filePath: match.filePath },
+          rawText: await this.readWorkerService.inspectPath(match.filePath),
+        }
       case 'read_files':
-        return { tool: match.tool, result: await this.readWorkerService.readTextFile(match.filePath) }
+        return {
+          kind: 'direct_tool_execution',
+          tool: match.tool,
+          input: { filePath: match.filePath },
+          rawText: await this.readWorkerService.readTextFile(match.filePath),
+        }
       case 'write_file':
-        return { tool: match.tool, result: await this.editWorkerService.writeTextFile(match.filePath, match.content) }
+        return {
+          kind: 'direct_tool_execution',
+          tool: match.tool,
+          input: { filePath: match.filePath, content: match.content },
+          rawText: await this.editWorkerService.writeTextFile(match.filePath, match.content),
+        }
       case 'edit_file':
         return {
+          kind: 'direct_tool_execution',
           tool: match.tool,
-          result: await this.editWorkerService.replaceInTextFile(
+          input: { filePath: match.filePath, search: match.search, replace: match.replace },
+          rawText: await this.editWorkerService.replaceInTextFile(
             match.filePath,
             match.search,
             match.replace
           ),
         }
       case 'create_shortcut':
-        return { tool: match.tool, result: this.createShortcutCapabilityMessage(match.targetName) }
+        return {
+          kind: 'direct_tool_execution',
+          tool: match.tool,
+          input: { targetName: match.targetName },
+          rawText: await this.desktopShortcutService.createApprovedShortcut(match.targetName),
+        }
+      case 'remove_shortcut':
+        return {
+          kind: 'direct_tool_execution',
+          tool: match.tool,
+          input: { targetName: match.targetName },
+          rawText: await this.desktopShortcutService.removeApprovedShortcut(match.targetName),
+        }
       case 'run_safe_command':
-        return { tool: match.tool, result: await this.terminalWorkerService.runCommand(match.command) }
+        return {
+          kind: 'direct_tool_execution',
+          tool: match.tool,
+          input: {
+            command: match.command,
+            target: match.target,
+            source: match.source,
+            explicitlyAllowsPrivilegeChanges:
+              match.explicitlyAllowsPrivilegeChanges ?? allowsPrivilegeChanges(userText, match.command),
+            brokerAction: match.brokerAction,
+          },
+          rawText: await this.terminalWorkerService.runCommand(match.command, {
+            explicitlyAllowsPrivilegeChanges:
+              match.explicitlyAllowsPrivilegeChanges ?? allowsPrivilegeChanges(userText, match.command),
+            target: match.target,
+            source: match.source,
+            brokerAction: match.brokerAction,
+          }),
+        }
       default:
         return null
     }
+  }
+
+  classify(userText: string): DirectToolMatch | null {
+    return this.matchTool(userText)
   }
 
   private matchTool(userText: string): DirectToolMatch | null {
     const text = userText.trim()
     let match: RegExpMatchArray | null
 
+    const parsedTerminalTask = this.terminalWorkerService.parseRequestedCommand(text)
+    if (parsedTerminalTask?.source === 'shell_request') {
+      return {
+        tool: 'run_safe_command',
+        command: parsedTerminalTask.command,
+        target: parsedTerminalTask.target,
+        source: parsedTerminalTask.source,
+        explicitlyAllowsPrivilegeChanges: parsedTerminalTask.explicitlyAllowsPrivilegeChanges,
+        brokerAction: parsedTerminalTask.brokerAction,
+      }
+    }
+
     if (/\b(?:list|show)\s+(?:all\s+)?containers\b/i.test(text) || /\bwhat containers\b/i.test(text)) {
       return { tool: 'list_containers' }
     }
 
     match =
+      text.match(/^\s*(?:inspect|check|show)\s+(?:the\s+)?docker\s+container\s+([a-zA-Z0-9._-]+)\s*$/i) ||
       text.match(/\b(?:inspect|check|show)\s+(?:the\s+)?(?:docker\s+)?container\s+([a-zA-Z0-9._-]+)/i) ||
       text.match(/\binspect_docker_container\s+([a-zA-Z0-9._-]+)/i)
     if (match) {
@@ -99,6 +195,8 @@ export class DirectToolRegistryService {
     }
 
     match =
+      text.match(/\b(?:inspect|check|show)\s+(?:the\s+)?files?\s+in\s+(.+)$/i) ||
+      text.match(/\b(?:inspect|check|show)\s+(?:the\s+)?directory\s+(.+)$/i) ||
       text.match(/\b(?:inspect|check)\s+(?:the\s+)?file\s+(.+)$/i) ||
       text.match(/\binspect_files\s+(.+)$/i)
     if (match) {
@@ -135,13 +233,19 @@ export class DirectToolRegistryService {
       }
     }
 
-    match =
-      text.match(/\b(?:create|make|add)\s+(?:a\s+)?shortcut\s+(?:for\s+)?(.+)$/i) ||
-      text.match(/\bcreate_shortcut\s+(.+)$/i)
-    if (match) {
+    const shortcutTarget = extractShortcutTarget(text)
+    if (shortcutTarget) {
       return {
         tool: 'create_shortcut',
-        targetName: stripWrappingQuotes(match[1]),
+        targetName: shortcutTarget,
+      }
+    }
+
+    const removeShortcutTarget = extractShortcutRemovalTarget(text)
+    if (removeShortcutTarget) {
+      return {
+        tool: 'remove_shortcut',
+        targetName: removeShortcutTarget,
       }
     }
 
@@ -157,41 +261,59 @@ export class DirectToolRegistryService {
 
     return null
   }
-
-  private createShortcutCapabilityMessage(targetName: string): string {
-    const normalizedTargetName = this.normalizeShortcutTargetName(targetName)
-
-    return [
-      normalizedTargetName
-        ? `Missing capability: create_shortcut is defined for ${normalizedTargetName}, but verified host Desktop shortcut creation is disabled right now.`
-        : 'Missing capability: create_shortcut is available in principle, but verified host Desktop shortcut creation is disabled right now.',
-      'Current status:',
-      '- No host Desktop action bridge is available.',
-      '- No direct host home-directory write access is available.',
-      '- To enable this tool safely, we need a narrow host shortcut bridge instead of broad host writes.',
-    ].join('\n')
-  }
-
-  private normalizeShortcutTargetName(value: string): string {
-    const normalized = value
-      .trim()
-      .replace(/\s+(?:please|for me)$/i, '')
-      .replace(/^(?:on|in)\s+ubuntu$/i, '')
-      .replace(/\s+(?:on|in)\s+ubuntu$/i, '')
-      .replace(/^(?:on|to)\s+the\s+desktop$/i, '')
-      .replace(/\s+(?:on|to)\s+the\s+desktop$/i, '')
-      .replace(/\s+and\s+put\s+it\s+on\s+the\s+desktop$/i, '')
-      .replace(/\s+and\s+add\s+it\s+to\s+the\s+desktop$/i, '')
-      .trim()
-
-    if (!normalized || /^(ubuntu|desktop|the desktop)$/i.test(normalized)) {
-      return ''
-    }
-
-    return normalized
-  }
 }
 
 function stripWrappingQuotes(value: string): string {
   return value.trim().replace(/^['"]|['"]$/g, '')
+}
+
+function extractShortcutTarget(text: string): string | null {
+  let match =
+    text.match(/\b(?:create|make|add)\s+(?:a\s+)?shortcut\s+(?:for\s+)?(.+)$/i) ||
+    text.match(/\bcreate_shortcut\s+(.+)$/i) ||
+    text.match(/\b(?:create|make|add)\s+(?:us\s+|me\s+)?a?\s*(.+?)\s+shortcut(?:\s+on\s+the\s+desktop|\s+to\s+the\s+desktop|\s+for\s+the\s+desktop)?$/i) ||
+    text.match(/\b(?:create|make|add)\s+(?:a\s+)?desktop\s+shortcut\s+(?:for\s+)?(.+)$/i)
+
+  if (!match) return null
+
+  const target = stripWrappingQuotes(match[1])
+  if (/^(?:on|in)\s+ubuntu$/i.test(target) || /^ubuntu$/i.test(target)) {
+    return null
+  }
+
+  return target
+}
+
+function extractShortcutRemovalTarget(text: string): string | null {
+  const match =
+    text.match(/\b(?:remove|delete|erase)\s+(?:the\s+)?(?:shortcut|launcher)\s+(?:for\s+)?(.+?)\s+(?:from|off)\s+(?:the\s+)?desktop$/i) ||
+    text.match(/\b(?:remove|delete|erase)\s+(.+?)\s+(?:shortcut|launcher)\s+(?:from|off)\s+(?:the\s+)?desktop$/i) ||
+    text.match(/\b(?:remove|delete|erase)\s+(?:the\s+)?(.+?)\s+(?:shortcut|launcher)$/i) ||
+    text.match(/\b(?:remove|delete|erase)\s+(?:the\s+)?(?:shortcut|launcher)\s+(?:for\s+)?(.+?)$/i)
+
+  if (!match) return null
+
+  const target = stripWrappingQuotes(match[1])
+    .replace(/\s+(?:from|off)\s+(?:the\s+)?desktop$/i, '')
+    .trim()
+  // Follow-up phrasing like "remove the shortcut you just created" needs prior context.
+  // Hermes should handle that as a follow-up, not a direct-tool target.
+  if (/\b(you just created|just created|that|it|this|same one)\b/i.test(target)) {
+    return null
+  }
+  return target
+}
+
+function allowsPrivilegeChanges(userText: string, command: string): boolean {
+  if (!/\b(?:sudo|chmod|chown|chgrp|setfacl|getfacl|install\s+-m|umask|usermod|groupmod)\b/i.test(command)) {
+    return false
+  }
+
+  return [
+    /\b--allow-permissions\b/i,
+    /\bwith explicit permission approval\b/i,
+    /\bi explicitly (?:want|need|am asking you) to change (?:the )?(?:permissions|ownership)\b/i,
+    /\bexplicitly change (?:the )?(?:permissions|ownership)\b/i,
+    /\bchange (?:the )?(?:permissions|ownership)\b.*\bexplicitly\b/i,
+  ].some((pattern) => pattern.test(userText))
 }

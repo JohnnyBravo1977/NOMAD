@@ -105,6 +105,11 @@ export default function SettingsPage(props: {
       ? `${uptimeHours}h ${uptimeMinutes}m`
       : `${uptimeMinutes}m`
 
+  const cpuSockets = Number((info?.cpu as any)?.processors || 0)
+  const cpuCoreSummary = cpuSockets > 1
+    ? `${info?.cpu.cores || 0} cores across ${cpuSockets} sockets`
+    : `${info?.cpu.cores || 0} cores`
+
   // Build storage display items - fall back to fsSize when disk array is empty
   const storageItems = getAllDiskDisplayItems(info?.disk, info?.fsSize)
 
@@ -143,7 +148,7 @@ export default function SettingsPage(props: {
                   label="CPU Usage"
                   size="lg"
                   variant="cpu"
-                  subtext={`${info?.cpu.cores || 0} cores`}
+                  subtext={cpuCoreSummary}
                   icon={<IconCpu className="w-8 h-8" />}
                 />
               </div>
@@ -195,6 +200,7 @@ export default function SettingsPage(props: {
                 data={[
                   { label: 'Manufacturer', value: info?.cpu.manufacturer },
                   { label: 'Brand', value: info?.cpu.brand },
+                  { label: 'Sockets', value: cpuSockets || 'Unknown' },
                   { label: 'Cores', value: info?.cpu.cores },
                   { label: 'Physical Cores', value: info?.cpu.physicalCores },
                   {

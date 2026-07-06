@@ -47,6 +47,10 @@ type ChatInput = {
   numCtx?: number
   keepAlive?: string
   maxTokens?: number
+  temperature?: number
+  topP?: number
+  topK?: number
+  repeatPenalty?: number
 }
 
 @inject()
@@ -55,6 +59,9 @@ export class OllamaService {
   private baseUrl: string | null = null
   private initPromise: Promise<void> | null = null
   private isOllamaNative: boolean | null = null
+  private thinkingCapabilityCache = new Map<string, { value: boolean; expiresAt: number }>()
+
+  private static THINKING_CAPABILITY_CACHE_MS = 10 * 60 * 1000
 
   constructor() {}
 
@@ -240,6 +247,18 @@ export class OllamaService {
     if (chatRequest.keepAlive && this.isOllamaNative !== false) {
       params.keep_alive = chatRequest.keepAlive
     }
+    if (typeof chatRequest.temperature === 'number') {
+      params.temperature = chatRequest.temperature
+    }
+    if (typeof chatRequest.topP === 'number') {
+      params.top_p = chatRequest.topP
+    }
+    if (typeof chatRequest.topK === 'number') {
+      params.top_k = chatRequest.topK
+    }
+    if (typeof chatRequest.repeatPenalty === 'number') {
+      params.repeat_penalty = chatRequest.repeatPenalty
+    }
 
     const response = await this.openai.chat.completions.create(params)
     const choice = response.choices[0]
@@ -286,6 +305,18 @@ export class OllamaService {
     }
     if (chatRequest.keepAlive && this.isOllamaNative !== false) {
       params.keep_alive = chatRequest.keepAlive
+    }
+    if (typeof chatRequest.temperature === 'number') {
+      params.temperature = chatRequest.temperature
+    }
+    if (typeof chatRequest.topP === 'number') {
+      params.top_p = chatRequest.topP
+    }
+    if (typeof chatRequest.topK === 'number') {
+      params.top_k = chatRequest.topK
+    }
+    if (typeof chatRequest.repeatPenalty === 'number') {
+      params.repeat_penalty = chatRequest.repeatPenalty
     }
 
     const stream = (await this.openai.chat.completions.create(params)) as unknown as Stream<ChatCompletionChunk>
@@ -373,6 +404,18 @@ export class OllamaService {
     if (chatRequest.maxTokens) {
       payload.options = { ...(payload.options || {}), num_predict: chatRequest.maxTokens }
     }
+    if (typeof chatRequest.temperature === 'number') {
+      payload.options = { ...(payload.options || {}), temperature: chatRequest.temperature }
+    }
+    if (typeof chatRequest.topP === 'number') {
+      payload.options = { ...(payload.options || {}), top_p: chatRequest.topP }
+    }
+    if (typeof chatRequest.topK === 'number') {
+      payload.options = { ...(payload.options || {}), top_k: chatRequest.topK }
+    }
+    if (typeof chatRequest.repeatPenalty === 'number') {
+      payload.options = { ...(payload.options || {}), repeat_penalty: chatRequest.repeatPenalty }
+    }
     try {
       const response = await axios.post(`${this.baseUrl}/api/chat`, payload, { timeout: 0 })
       return response.data as NomadChatResponse
@@ -398,6 +441,18 @@ export class OllamaService {
     }
     if (chatRequest.maxTokens) {
       payload.options = { ...(payload.options || {}), num_predict: chatRequest.maxTokens }
+    }
+    if (typeof chatRequest.temperature === 'number') {
+      payload.options = { ...(payload.options || {}), temperature: chatRequest.temperature }
+    }
+    if (typeof chatRequest.topP === 'number') {
+      payload.options = { ...(payload.options || {}), top_p: chatRequest.topP }
+    }
+    if (typeof chatRequest.topK === 'number') {
+      payload.options = { ...(payload.options || {}), top_k: chatRequest.topK }
+    }
+    if (typeof chatRequest.repeatPenalty === 'number') {
+      payload.options = { ...(payload.options || {}), repeat_penalty: chatRequest.repeatPenalty }
     }
 
     let response: any
@@ -437,15 +492,31 @@ export class OllamaService {
     await this._ensureDependencies()
     if (!this.baseUrl) return false
 
+    const normalizedModel = modelName.trim().toLowerCase()
+    const cached = this.thinkingCapabilityCache.get(normalizedModel)
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.value
+    }
+
     try {
       const response = await axios.post(
         `${this.baseUrl}/api/show`,
         { model: modelName },
         { timeout: 5000 }
       )
-      return Array.isArray(response.data?.capabilities) && response.data.capabilities.includes('thinking')
+      const supportsThinking =
+        Array.isArray(response.data?.capabilities) && response.data.capabilities.includes('thinking')
+      this.thinkingCapabilityCache.set(normalizedModel, {
+        value: supportsThinking,
+        expiresAt: Date.now() + OllamaService.THINKING_CAPABILITY_CACHE_MS,
+      })
+      return supportsThinking
     } catch {
       // Non-Ollama backends don't expose /api/show — assume no thinking support
+      this.thinkingCapabilityCache.set(normalizedModel, {
+        value: false,
+        expiresAt: Date.now() + OllamaService.THINKING_CAPABILITY_CACHE_MS,
+      })
       return false
     }
   }

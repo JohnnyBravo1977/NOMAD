@@ -1,0 +1,27 @@
+{
+  "id": "/",
+  "name": "Project N.O.M.A.D.",
+  "short_name": "N.O.M.A.D.",
+  "description": "Project N.O.M.A.D. Command Center",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui", "browser"],
+  "background_color": "#efe4c5",
+  "theme_color": "#8a7a4e",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/favicon-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/favicon-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

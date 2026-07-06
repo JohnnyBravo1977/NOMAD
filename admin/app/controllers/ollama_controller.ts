@@ -57,7 +57,7 @@ export default class OllamaController {
     }
 
     try {
-      const chatResult = await this.hermesRouterService.runChatTurn({
+      const routed = await this.hermesRouterService.runChatTurn({
         requestData: reqData,
         ragService: this.ragService,
         perfStart,
@@ -66,9 +66,29 @@ export default class OllamaController {
         },
       })
 
+      const chatResult = routed.result
+
       if (chatResult.kind === 'stream') {
         response.response.end()
         return
+      }
+
+      if (reqData.debug) {
+        const hermesTurn = routed.hermesTurn
+          ? {
+              turn_type: routed.hermesTurn.turn_type,
+              should_execute: routed.hermesTurn.should_execute,
+              confidence: routed.hermesTurn.confidence,
+              tasks: routed.hermesTurn.tasks?.map((t) => ({
+                order: t.order,
+                route: t.route,
+                canonical_request: t.canonical_request,
+                tool: t.tool,
+              })),
+            }
+          : null
+
+        return { ...chatResult.body, debug: { hermesTurn } }
       }
 
       return chatResult.body
@@ -78,7 +98,13 @@ export default class OllamaController {
         response.response.end()
         return
       }
-      throw error
+      logger.error(
+        `[OllamaController] /api/ollama/chat failed: ${error instanceof Error ? error.message : String(error)}`
+      )
+      return response.status(500).send({
+        error: true,
+        message: error instanceof Error ? error.message : 'Chat request failed.',
+      })
     }
   }
 

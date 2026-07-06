@@ -1,19 +1,23 @@
 import ChatSession from '#models/chat_session'
 import ChatMessage from '#models/chat_message'
+import type { NomadUserSpace } from '#services/user_space_service'
 import logger from '@adonisjs/core/services/logger'
 import { DateTime } from 'luxon'
 import { inject } from '@adonisjs/core'
 import { OllamaService } from './ollama_service.js'
 import { DEFAULT_QUERY_REWRITE_MODEL, SYSTEM_PROMPTS } from '../../constants/ollama.js'
 import { toTitleCase } from '../utils/misc.js'
+import type { OllamaChatAttachment } from '../../types/ollama.js'
 
 @inject()
 export class ChatService {
   constructor(private ollamaService: OllamaService) {}
 
-  async getAllSessions() {
+  async getAllSessions(userSpace: NomadUserSpace) {
     try {
-      const sessions = await ChatSession.query().orderBy('updated_at', 'desc')
+      const sessions = await ChatSession.query()
+        .where('owner_user_id', userSpace.user.id)
+        .orderBy('updated_at', 'desc')
       return sessions.map((session) => ({
         id: session.id.toString(),
         title: session.title,
@@ -96,9 +100,13 @@ export class ChatService {
     }
   }
 
-  async getSession(sessionId: number) {
+  async getSession(sessionId: number, userSpace: NomadUserSpace) {
     try {
-      const session = await ChatSession.query().where('id', sessionId).preload('messages').first()
+      const session = await ChatSession.query()
+        .where('id', sessionId)
+        .where('owner_user_id', userSpace.user.id)
+        .preload('messages')
+        .first()
 
       if (!session) {
         return null
@@ -113,6 +121,7 @@ export class ChatService {
           id: msg.id.toString(),
           role: msg.role,
           content: msg.content,
+          attachments: msg.attachments || [],
           timestamp: msg.created_at.toJSDate(),
         })),
       }
@@ -126,11 +135,14 @@ export class ChatService {
     }
   }
 
-  async createSession(title: string, model?: string) {
+  async createSession(title: string, model: string | undefined, userSpace: NomadUserSpace) {
     try {
       const session = await ChatSession.create({
         title,
         model: model || null,
+        family_id: userSpace.family.id,
+        owner_user_id: userSpace.user.id,
+        scope: 'user_private',
       })
 
       return {
@@ -147,9 +159,17 @@ export class ChatService {
     }
   }
 
-  async updateSession(sessionId: number, data: { title?: string; model?: string }) {
+  async updateSession(
+    sessionId: number,
+    data: { title?: string; model?: string },
+    userSpace?: NomadUserSpace | null
+  ) {
     try {
-      const session = await ChatSession.findOrFail(sessionId)
+      const sessionQuery = ChatSession.query().where('id', sessionId)
+      if (userSpace) {
+        sessionQuery.where('owner_user_id', userSpace.user.id)
+      }
+      const session = await sessionQuery.firstOrFail()
 
       if (data.title) {
         session.title = data.title
@@ -176,12 +196,29 @@ export class ChatService {
     }
   }
 
-  async addMessage(sessionId: number, role: 'system' | 'user' | 'assistant', content: string) {
+  async addMessage(
+    sessionId: number,
+    role: 'system' | 'user' | 'assistant',
+    content: string,
+    userSpace?: NomadUserSpace | null,
+    attachments?: OllamaChatAttachment[]
+  ) {
     try {
+      if (userSpace) {
+        const session = await ChatSession.query()
+          .where('id', sessionId)
+          .where('owner_user_id', userSpace.user.id)
+          .first()
+        if (!session) {
+          throw new Error('Chat session not found')
+        }
+      }
+
       const message = await ChatMessage.create({
         session_id: sessionId,
         role,
         content,
+        attachments: attachments || [],
       })
 
       // Update session's updated_at timestamp
@@ -193,6 +230,7 @@ export class ChatService {
         id: message.id.toString(),
         role: message.role,
         content: message.content,
+        attachments: message.attachments || [],
         timestamp: message.created_at.toJSDate(),
       }
     } catch (error) {
@@ -205,9 +243,12 @@ export class ChatService {
     }
   }
 
-  async deleteSession(sessionId: number) {
+  async deleteSession(sessionId: number, userSpace: NomadUserSpace) {
     try {
-      const session = await ChatSession.findOrFail(sessionId)
+      const session = await ChatSession.query()
+        .where('id', sessionId)
+        .where('owner_user_id', userSpace.user.id)
+        .firstOrFail()
       await session.delete()
       return { success: true }
     } catch (error) {
@@ -220,8 +261,16 @@ export class ChatService {
     }
   }
 
-  async getMessageCount(sessionId: number): Promise<number> {
+  async getMessageCount(sessionId: number, userSpace?: NomadUserSpace | null): Promise<number> {
     try {
+      if (userSpace) {
+        const session = await ChatSession.query()
+          .where('id', sessionId)
+          .where('owner_user_id', userSpace.user.id)
+          .first()
+        if (!session) return 0
+      }
+
       const count = await ChatMessage.query().where('session_id', sessionId).count('* as total')
       return Number(count[0].$extras.total)
     } catch (error) {
@@ -275,11 +324,24 @@ export class ChatService {
 
   async deleteAllSessions() {
     try {
-      await ChatSession.query().delete()
-      return { success: true, message: 'All chat sessions deleted' }
+      throw new Error('User space is required to delete chat sessions')
     } catch (error) {
       logger.error(
         `[ChatService] Failed to delete all sessions: ${
+          error instanceof Error ? error.message : error
+        }`
+      )
+      throw new Error('Failed to delete all chat sessions')
+    }
+  }
+
+  async deleteAllSessionsForUser(userSpace: NomadUserSpace) {
+    try {
+      await ChatSession.query().where('owner_user_id', userSpace.user.id).delete()
+      return { success: true, message: 'All chat sessions deleted' }
+    } catch (error) {
+      logger.error(
+        `[ChatService] Failed to delete all sessions for user ${userSpace.user.id}: ${
           error instanceof Error ? error.message : error
         }`
       )

@@ -500,6 +500,7 @@ export class DockerService {
       // GPU-aware configuration for Ollama
       let finalImage = service.container_image
       let gpuHostConfig = containerConfig?.HostConfig || {}
+      let gpuRuntime: string | undefined = undefined
 
       if (service.service_name === SERVICE_NAMES.OLLAMA) {
         const gpuResult = await this._detectGPUType()
@@ -514,6 +515,7 @@ export class DockerService {
           // Add GPU support for NVIDIA
           gpuHostConfig = {
             ...gpuHostConfig,
+            Runtime: 'nvidia',
             DeviceRequests: [
               {
                 Driver: 'nvidia',
@@ -522,6 +524,7 @@ export class DockerService {
               },
             ],
           }
+          gpuRuntime = 'nvidia'
         } else if (gpuResult.type === 'amd') {
           this._broadcast(
             service.service_name,
@@ -561,6 +564,12 @@ export class DockerService {
         if (process.env.NOMAD_OLLAMA_MAX_QUEUE) {
           ollamaEnv.push(`OLLAMA_MAX_QUEUE=${process.env.NOMAD_OLLAMA_MAX_QUEUE}`)
         }
+        if (process.env.NOMAD_OLLAMA_MAX_LOADED_MODELS) {
+          ollamaEnv.push(`OLLAMA_MAX_LOADED_MODELS=${process.env.NOMAD_OLLAMA_MAX_LOADED_MODELS}`)
+        }
+        if (process.env.NOMAD_OLLAMA_NUM_PARALLEL) {
+          ollamaEnv.push(`OLLAMA_NUM_PARALLEL=${process.env.NOMAD_OLLAMA_NUM_PARALLEL}`)
+        }
       }
 
       this._broadcast(
@@ -577,7 +586,10 @@ export class DockerService {
           'io.project-nomad.managed': 'true',
         },
         ...(containerConfig?.User && { User: containerConfig.User }),
-        HostConfig: gpuHostConfig,
+        HostConfig: {
+          ...gpuHostConfig,
+          ...(gpuRuntime ? { Runtime: gpuRuntime } : {}),
+        },
         ...(containerConfig?.WorkingDir && { WorkingDir: containerConfig.WorkingDir }),
         ...(containerConfig?.ExposedPorts && { ExposedPorts: containerConfig.ExposedPorts }),
         Env: [...(containerConfig?.Env ?? []), ...ollamaEnv],
@@ -1065,6 +1077,7 @@ export class DockerService {
       // Ollama setup, and ensures DeviceRequests are always built fresh rather than relying on
       // round-tripping the Docker inspect format back into the create API.
       let updatedDeviceRequests: any[] | undefined = undefined
+      let updatedRuntime: string | undefined = undefined
       if (serviceName === SERVICE_NAMES.OLLAMA) {
         const gpuResult = await this._detectGPUType()
 
@@ -1081,6 +1094,7 @@ export class DockerService {
               Capabilities: [['gpu']],
             },
           ]
+          updatedRuntime = 'nvidia'
         } else if (gpuResult.type === 'amd') {
           this._broadcast(
             serviceName,
@@ -1110,6 +1124,7 @@ export class DockerService {
           Binds: hostConfig.Binds || undefined,
           PortBindings: hostConfig.PortBindings || undefined,
           RestartPolicy: hostConfig.RestartPolicy || undefined,
+          Runtime: serviceName === SERVICE_NAMES.OLLAMA ? updatedRuntime : (hostConfig.Runtime || undefined),
           DeviceRequests: serviceName === SERVICE_NAMES.OLLAMA ? updatedDeviceRequests : (hostConfig.DeviceRequests || undefined),
           Devices: hostConfig.Devices || undefined,
         },

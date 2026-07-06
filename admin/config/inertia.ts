@@ -1,5 +1,6 @@
 import KVStore from '#models/kv_store'
 import { SystemService } from '#services/system_service'
+import { UserSpaceContextService } from '#services/user_space_context_service'
 import { defineConfig } from '@adonisjs/inertia'
 import type { InferSharedProps } from '@adonisjs/inertia/types'
 
@@ -21,6 +22,7 @@ const inertiaConfig = defineConfig({
   sharedData: {
     appVersion: () => SystemService.getAppVersion(),
     environment: process.env.NODE_ENV || 'production',
+    userSpace: () => UserSpaceContextService.get(),
     aiAssistantName: async () => {
       const now = Date.now()
       if (_assistantNameCache && now < _assistantNameCache.expiresAt) {

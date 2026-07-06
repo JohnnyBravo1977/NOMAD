@@ -1,31 +1,106 @@
 import { RagService } from '#services/rag_service'
 import { EmbedFileJob } from '#jobs/embed_file_job'
+import LibraryItem from '#models/library_item'
+import { UserSpaceService } from '#services/user_space_service'
 import { inject } from '@adonisjs/core'
 import type { HttpContext } from '@adonisjs/core/http'
 import app from '@adonisjs/core/services/app'
+import { join } from 'node:path'
 import { randomBytes } from 'node:crypto'
+import { rm } from 'node:fs/promises'
 import { sanitizeFilename } from '../utils/fs.js'
-import { deleteFileSchema, getJobStatusSchema } from '#validators/rag'
+import { deleteFileSchema, getJobStatusSchema, uploadFileSchema } from '#validators/rag'
 
 @inject()
 export default class RagController {
-  constructor(private ragService: RagService) { }
+  constructor(
+    private ragService: RagService,
+    private userSpaceService: UserSpaceService
+  ) { }
 
   public async upload({ request, response }: HttpContext) {
+    const userSpace = await this.userSpaceService.resolveRequestSpace(request)
+    if (!userSpace) {
+      return response.status(401).json({ error: 'Authentication required.' })
+    }
+    const uploadData = await uploadFileSchema.validate({
+      scope: request.input('scope'),
+    })
     const uploadedFile = request.file('file')
     if (!uploadedFile) {
       return response.status(400).json({ error: 'No file uploaded' })
+    }
+
+    const scope = uploadData.scope || 'user_private'
+    if (scope === 'family_shared' && !userSpace.canUploadFamilyShared) {
+      return response.status(403).json({
+        error: 'This account cannot upload into family shared space without admin approval.',
+      })
+    }
+
+    if ((uploadedFile.extname || '').toLowerCase() === 'zip') {
+      const tempName = `${randomBytes(8).toString('hex')}.zip`
+      await uploadedFile.move('/tmp', { name: tempName, overwrite: true })
+
+      if (!uploadedFile.filePath) {
+        return response.status(500).json({ error: 'Failed to store uploaded ZIP file.' })
+      }
+
+      try {
+        const result = await this.ragService.importZipUpload(
+          uploadedFile.filePath,
+          uploadedFile.clientName,
+          scope,
+          userSpace
+        )
+
+        if (!result.success) {
+          return response.status(400).json({ error: result.message })
+        }
+
+        return response.status(202).json({
+          message: result.message,
+          queuedFiles: result.queuedFiles,
+          skippedFiles: result.skippedFiles,
+          filePaths: result.filePaths,
+          scope,
+        })
+      } finally {
+        await rm(uploadedFile.filePath, { force: true }).catch(() => {})
+      }
     }
 
     const randomSuffix = randomBytes(6).toString('hex')
     const sanitizedName = sanitizeFilename(uploadedFile.clientName)
 
     const fileName = `${sanitizedName}-${randomSuffix}.${uploadedFile.extname || 'txt'}`
-    const fullPath = app.makePath(RagService.UPLOADS_STORAGE_PATH, fileName)
+    const storageSegments =
+      scope === 'family_shared'
+        ? ['families', userSpace.family.slug, 'shared']
+        : ['users', userSpace.user.slug]
+    const storagePath = join(RagService.UPLOADS_STORAGE_PATH, ...storageSegments)
+    const fullPath = app.makePath(storagePath, fileName)
 
-    await uploadedFile.move(app.makePath(RagService.UPLOADS_STORAGE_PATH), {
+    await uploadedFile.move(app.makePath(storagePath), {
       name: fileName,
     })
+
+    const source = fullPath
+
+    await LibraryItem.updateOrCreate(
+      { source },
+      {
+        source,
+        storage_path: storagePath,
+        display_name: uploadedFile.clientName,
+        scope,
+        status: scope === 'family_shared' ? 'approved' : 'approved',
+        family_id: userSpace.family.id,
+        owner_user_id: scope === 'user_private' ? userSpace.user.id : null,
+        uploaded_by_user_id: userSpace.user.id,
+        approved_by_user_id: scope === 'family_shared' && userSpace.canAccessAdminTools ? userSpace.user.id : null,
+      }
+    )
 
     // Dispatch background job for embedding
     const result = await EmbedFileJob.dispatch({
@@ -37,8 +112,9 @@ export default class RagController {
       message: result.message,
       jobId: result.jobId,
       fileName,
-      filePath: `/${RagService.UPLOADS_STORAGE_PATH}/${fileName}`,
+      filePath: `/${storagePath}/${fileName}`,
       alreadyProcessing: !result.created,
+      scope,
     })
   }
 
@@ -60,14 +136,22 @@ export default class RagController {
     return response.status(200).json(status)
   }
 
-  public async getStoredFiles({ response }: HttpContext) {
-    const files = await this.ragService.getStoredFiles()
+  public async getStoredFiles({ request, response }: HttpContext) {
+    const userSpace = await this.userSpaceService.resolveRequestSpace(request)
+    if (!userSpace) {
+      return response.status(401).json({ error: 'Authentication required.' })
+    }
+    const files = await this.ragService.getUploadedStoredFiles(userSpace)
     return response.status(200).json({ files })
   }
 
   public async deleteFile({ request, response }: HttpContext) {
+    const userSpace = await this.userSpaceService.resolveRequestSpace(request)
+    if (!userSpace) {
+      return response.status(401).json({ error: 'Authentication required.' })
+    }
     const { source } = await request.validateUsing(deleteFileSchema)
-    const result = await this.ragService.deleteFileBySource(source)
+    const result = await this.ragService.deleteFileBySource(source, userSpace)
     if (!result.success) {
       return response.status(500).json({ error: result.message })
     }

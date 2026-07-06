@@ -8,6 +8,7 @@ import { DateTime } from 'luxon'
 type SystemTask =
   | { kind: 'time' }
   | { kind: 'date' }
+  | { kind: 'time_and_date' }
   | { kind: 'uptime' }
   | { kind: 'system_status' }
   | { kind: 'service_status'; serviceName?: string }
@@ -35,7 +36,7 @@ export class SystemWorkerService {
   }
 
   async tryHandle(userText: string): Promise<string | null> {
-    const task = this.parseTask(userText)
+    const task = this.classify(userText)
     if (!task) return null
 
     switch (task.kind) {
@@ -43,6 +44,8 @@ export class SystemWorkerService {
         return this.getCurrentTime()
       case 'date':
         return this.getCurrentDate()
+      case 'time_and_date':
+        return this.getCurrentTimeAndDate()
       case 'uptime':
         return this.getUptime()
       case 'system_status':
@@ -56,14 +59,36 @@ export class SystemWorkerService {
     }
   }
 
+  classify(userText: string): SystemTask | null {
+    return this.parseTask(userText)
+  }
+
   private parseTask(userText: string): SystemTask | null {
     const text = userText.trim()
 
-    if (/^(what(?:'s| is)\s+the\s+time|current time|time is it|what time is it)\b/i.test(text)) {
+    if (
+      /^(?:what(?:'s|s| is)\s+(?:today'?s\s+)?(?:date\s+and\s+time|time\s+and\s+(?:day|date)|day\s+and\s+time)|what\s+time\s+and\s+(?:day|date)\s+is\s+it|what\s+day\s+and\s+time\s+is\s+it)\b/i.test(
+        text
+      ) ||
+      /^(?:what(?:'s|s| is)\s+(?:the\s+)?)?(?:date\s+and\s+time|time\s+and\s+date)\b/i.test(text) ||
+      /^(?:current|today'?s)\s+(?:date\s+and\s+time|time\s+and\s+date)\b/i.test(text)
+    ) {
+      return { kind: 'time_and_date' }
+    }
+
+    if (
+      /^(?:what(?:'s|s| is)\s+the\s+time|what\s+time\s+is\s+it|current time|time is it|whats the time)\b/i.test(
+        text
+      )
+    ) {
       return { kind: 'time' }
     }
 
-    if (/^(what(?:'s| is)\s+the\s+date|current date|what day is it|today'?s date)\b/i.test(text)) {
+    if (
+      /^(?:what(?:'s|s| is)\s+the\s+date|what\s+day\s+is\s+it|current date|today'?s date|todays date)\b/i.test(
+        text
+      )
+    ) {
       return { kind: 'date' }
     }
 
@@ -98,12 +123,17 @@ export class SystemWorkerService {
 
   private getCurrentTime(): string {
     const now = getNow()
-    return `Current time: ${now.toFormat('h:mm a')} (${now.zoneName})`
+    return `It is ${now.toFormat('h:mm a')} in ${now.zoneName}.`
   }
 
   private getCurrentDate(): string {
     const now = getNow()
-    return `Current date: ${now.toFormat('EEEE, MMMM d, yyyy')}`
+    return `Today is ${now.toFormat('EEEE, MMMM d, yyyy')}.`
+  }
+
+  private getCurrentTimeAndDate(): string {
+    const now = getNow()
+    return `It is ${now.toFormat('h:mm a')} on ${now.toFormat('EEEE, MMMM d, yyyy')} in ${now.zoneName}.`
   }
 
   private async getUptime(): Promise<string> {

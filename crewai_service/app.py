@@ -326,8 +326,8 @@ def find_first_signal(*texts: str) -> Optional[str]:
         for stripped in lines:
             if not stripped:
                 continue
-                if re.search(pattern, stripped, re.IGNORECASE):
-                    return stripped
+            if re.search(pattern, stripped, re.IGNORECASE):
+                return stripped
     return None
 
 

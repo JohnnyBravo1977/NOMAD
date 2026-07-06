@@ -110,6 +110,10 @@ export default defineConfig({
       pattern: 'public/**',
       reloadServer: false,
     },
+    {
+      pattern: 'scripts/conversation_cases.json',
+      reloadServer: false,
+    },
   ],
 
   assetsBundler: false,

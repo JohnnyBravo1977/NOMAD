@@ -23,9 +23,22 @@ export type NomadOllamaModelAPIResponse = {
   models: NomadOllamaModel[]
 }
 
+export type OllamaChatAttachment = {
+  id: string
+  name: string
+  mimeType: string
+  size: number
+  kind: 'image' | 'pdf'
+  token: string
+  viewUrl?: string
+  width?: number
+  height?: number
+}
+
 export type OllamaChatMessage = {
   role: 'system' | 'user' | 'assistant'
   content: string
+  attachments?: OllamaChatAttachment[]
 }
 
 export type OllamaChatRequest = {
@@ -34,6 +47,7 @@ export type OllamaChatRequest = {
   stream?: boolean
   think?: boolean | 'medium'
   sessionId?: number
+  debug?: boolean
 }
 
 export type OllamaChatResponse = {

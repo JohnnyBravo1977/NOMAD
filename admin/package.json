@@ -13,6 +13,7 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "typecheck": "tsc --noEmit",
+    "test:conversation": "node scripts/conversation_harness.mjs",
     "work:downloads": "node ace queue:work --queue=downloads",
     "work:model-downloads": "node ace queue:work --queue=model-downloads",
     "work:benchmarks": "node ace queue:work --queue=benchmarks",

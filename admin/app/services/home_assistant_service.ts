@@ -8,30 +8,134 @@ type HaState = {
   attributes?: Record<string, any>
 }
 
+type HaAreaRegistryEntry = {
+  id: string
+  name?: string
+  aliases?: string[]
+}
+
+type HaDeviceRegistryEntry = {
+  id: string
+  area_id?: string | null
+  name?: string | null
+  name_by_user?: string | null
+}
+
+type HaEntityRegistryEntry = {
+  entity_id: string
+  device_id?: string | null
+  area_id?: string | null
+}
+
+type HaRegistrySnapshot = {
+  areas: HaAreaRegistryEntry[]
+  devices: HaDeviceRegistryEntry[]
+  entities: HaEntityRegistryEntry[]
+}
+
+type TimedCache<T> = {
+  value: T
+  expiresAt: number
+}
+
 @inject()
 export class HomeAssistantService {
+  private statesCache: TimedCache<HaState[]> | null = null
+  private availabilityCache: TimedCache<boolean> | null = null
+  private registrySnapshotCache: TimedCache<HaRegistrySnapshot> | null = null
+
+  private static STATES_CACHE_MS = 2500
+  private static AVAILABILITY_CACHE_MS = 5000
+  private static REGISTRY_CACHE_MS = 60 * 1000
+
   constructor(private dockerService: DockerService) {}
 
   async getStates(): Promise<HaState[]> {
+    const cached = this.getFreshCache(this.statesCache)
+    if (cached) {
+      return cached
+    }
+
     const response = await this.request('GET', '/api/states')
-    return Array.isArray(response) ? response : []
+    const states = Array.isArray(response) ? response : []
+    this.statesCache = {
+      value: states,
+      expiresAt: Date.now() + HomeAssistantService.STATES_CACHE_MS,
+    }
+    this.availabilityCache = {
+      value: true,
+      expiresAt: Date.now() + HomeAssistantService.AVAILABILITY_CACHE_MS,
+    }
+    return states
   }
 
   async getState(entityId: string): Promise<HaState | null> {
+    const cachedStates = this.getFreshCache(this.statesCache)
+    if (cachedStates) {
+      return cachedStates.find((state) => state.entity_id === entityId) || null
+    }
+
     const response = await this.request('GET', `/api/states/${entityId}`)
     return response && typeof response === 'object' ? response as HaState : null
   }
 
   async callService(domain: string, service: string, serviceData: Record<string, any>): Promise<any> {
-    return this.request('POST', `/api/services/${domain}/${service}`, serviceData)
+    const response = await this.request('POST', `/api/services/${domain}/${service}`, serviceData)
+    this.invalidateStateCaches()
+    return response
   }
 
   async isAvailable(): Promise<boolean> {
+    const cached = this.getFreshCache(this.availabilityCache)
+    if (typeof cached === 'boolean') {
+      return cached
+    }
+
     try {
       await this.getStates()
+      this.availabilityCache = {
+        value: true,
+        expiresAt: Date.now() + HomeAssistantService.AVAILABILITY_CACHE_MS,
+      }
       return true
     } catch {
+      this.availabilityCache = {
+        value: false,
+        expiresAt: Date.now() + HomeAssistantService.AVAILABILITY_CACHE_MS,
+      }
       return false
+    }
+  }
+
+  async findAreaLightTargets(areaRef: string): Promise<{ areaName: string; entityIds: string[] } | null> {
+    const normalizedRef = this.normalizeAreaReference(areaRef)
+    if (!normalizedRef) return null
+
+    const [registries, states] = await Promise.all([this.getRegistrySnapshot(), this.getStates()])
+    const area = this.findBestAreaMatch(registries.areas, normalizedRef)
+    if (!area) return null
+
+    const deviceAreaById = new Map(
+      registries.devices.map((device) => [device.id, device.area_id || null])
+    )
+
+    const lightEntityIds = registries.entities
+      .filter((entity) => entity.entity_id.startsWith('light.'))
+      .filter((entity) => {
+        const entityAreaId = entity.area_id || deviceAreaById.get(entity.device_id || '') || null
+        return entityAreaId === area.id
+      })
+      .map((entity) => entity.entity_id)
+
+    if (!lightEntityIds.length) return null
+
+    const liveEntityIds = new Set(states.map((state) => state.entity_id))
+    const availableEntityIds = lightEntityIds.filter((entityId) => liveEntityIds.has(entityId))
+    if (!availableEntityIds.length) return null
+
+    return {
+      areaName: area.name?.trim() || area.id,
+      entityIds: availableEntityIds,
     }
   }
 
@@ -68,10 +172,7 @@ export class HomeAssistantService {
     endpoint: string,
     body?: Record<string, any>
   ) {
-    const containers = await this.dockerService.docker.listContainers({ all: true })
-    const haContainer = containers.find((container) =>
-      container.Names.some((name) => name.replace(/^\//, '') === 'homeassistant')
-    )
+    const haContainer = await this.getHaContainer()
     if (!haContainer) {
       throw new Error('Home Assistant container is not available.')
     }
@@ -153,5 +254,127 @@ with urllib.request.urlopen(req, timeout=10) as res:
     } catch {
       throw new Error(output)
     }
+  }
+
+  private async getRegistrySnapshot(): Promise<HaRegistrySnapshot> {
+    const cached = this.getFreshCache(this.registrySnapshotCache)
+    if (cached) {
+      return cached
+    }
+
+    const haContainer = await this.getHaContainer()
+    if (!haContainer) {
+      throw new Error('Home Assistant container is not available.')
+    }
+
+    const script = `
+import json
+
+def read_json(filename):
+    with open(filename, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+areas = read_json('/config/.storage/core.area_registry')['data'].get('areas', [])
+devices = read_json('/config/.storage/core.device_registry')['data'].get('devices', [])
+entities = read_json('/config/.storage/core.entity_registry')['data'].get('entities', [])
+
+print(json.dumps({
+    'areas': areas,
+    'devices': devices,
+    'entities': entities,
+}))
+`.trim()
+
+    const exec = await this.dockerService.docker.getContainer(haContainer.Id).exec({
+      Cmd: ['python3', '-c', script],
+      AttachStdout: true,
+      AttachStderr: true,
+      Tty: true,
+    })
+
+    const stream = await exec.start({ Tty: true })
+    const output = await new Promise<string>((resolve, reject) => {
+      let data = ''
+      stream.on('data', (chunk: Buffer) => {
+        data += chunk.toString('utf-8')
+      })
+      stream.on('end', () => resolve(data.trim()))
+      stream.on('error', reject)
+    })
+
+    const snapshot = !output
+      ? { areas: [], devices: [], entities: [] }
+      : (JSON.parse(output) as HaRegistrySnapshot)
+
+    this.registrySnapshotCache = {
+      value: snapshot,
+      expiresAt: Date.now() + HomeAssistantService.REGISTRY_CACHE_MS,
+    }
+
+    return snapshot
+  }
+
+  private async getHaContainer() {
+    const containers = await this.dockerService.docker.listContainers({ all: true })
+    return containers.find((container) =>
+      container.Names.some((name) => name.replace(/^\//, '') === 'homeassistant')
+    )
+  }
+
+  private findBestAreaMatch(
+    areas: HaAreaRegistryEntry[],
+    normalizedRef: string
+  ): HaAreaRegistryEntry | null {
+    let best: { area: HaAreaRegistryEntry; score: number } | null = null
+
+    for (const area of areas) {
+      const candidates = [area.name || '', ...(area.aliases || [])]
+        .map((value) => this.normalizeAreaReference(value))
+        .filter(Boolean)
+
+      for (const candidate of candidates) {
+        let score = 0
+        if (candidate === normalizedRef) {
+          score = 100
+        } else if (normalizedRef.includes(candidate) || candidate.includes(normalizedRef)) {
+          score = 85
+        } else {
+          const needleTokens = new Set(normalizedRef.split(' ').filter(Boolean))
+          const matchedTokens = candidate
+            .split(' ')
+            .filter((token) => needleTokens.has(token)).length
+          if (matchedTokens > 0) {
+            score = matchedTokens * 10
+          }
+        }
+
+        if (score > 0 && (!best || score > best.score)) {
+          best = { area, score }
+        }
+      }
+    }
+
+    return best?.area || null
+  }
+
+  private normalizeAreaReference(value: string): string {
+    return value
+      .toLowerCase()
+      .replace(/[_./-]+/g, ' ')
+      .replace(/\b(the|a|an|my|all)\b/g, ' ')
+      .replace(/\b(lights|light|lamps|lamp)\b/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+
+  private getFreshCache<T>(cache: TimedCache<T> | null): T | null {
+    if (!cache) return null
+    if (cache.expiresAt <= Date.now()) return null
+    return cache.value
+  }
+
+  private invalidateStateCaches() {
+    this.statesCache = null
+    this.availabilityCache = null
   }
 }

@@ -1,12 +1,14 @@
 import {
   IconBolt,
   IconHelp,
+  IconHome,
   IconMapRoute,
   IconPlus,
   IconSettings,
+  IconVolume,
   IconWifiOff,
 } from '@tabler/icons-react'
-import { Head, Link, router, usePage } from '@inertiajs/react'
+import { Head, router, usePage } from '@inertiajs/react'
 import AppLayout from '~/layouts/AppLayout'
 import { getServiceLink } from '~/lib/navigation'
 import { ServiceSlim } from '../../types/services'
@@ -62,6 +64,26 @@ const SYSTEM_ITEMS = [
     poweredBy: null,
   },
   {
+    label: 'Dome Planner',
+    to: '/dome-planner',
+    target: '',
+    description: 'Lay out domes, track design moves, and review Quinn planning logs',
+    icon: <IconHome size={48} />,
+    installed: true,
+    displayOrder: 52.25,
+    poweredBy: null,
+  },
+  {
+    label: 'Voice Studio',
+    to: '/voice-settings',
+    target: '',
+    description: 'Build and test Quinn voice characters and manage speech routing',
+    icon: <IconVolume size={48} />,
+    installed: true,
+    displayOrder: 52.5,
+    poweredBy: null,
+  },
+  {
     label: 'Settings',
     to: '/settings/system',
     target: '',
@@ -82,6 +104,7 @@ interface DashboardItem {
   installed: boolean
   displayOrder: number
   poweredBy: string | null
+  openInNewTab?: boolean
 }
 
 export default function Home(props: {
@@ -90,12 +113,25 @@ export default function Home(props: {
   }
 }) {
   const items: DashboardItem[] = []
-  const updateInfo = useUpdateAvailable();
-  const { aiAssistantName } = usePage<{ aiAssistantName: string }>().props
+  const { aiAssistantName, userSpace, appVersion } = usePage<{
+    aiAssistantName: string
+    appVersion: string
+    userSpace?: { canAccessAdminTools: boolean } | null
+  }>().props
+  const canAccessAdminTools = !!userSpace?.canAccessAdminTools
+  const updateInfo = useUpdateAvailable(canAccessAdminTools)
+
+  const withVersionedLocalLink = (href: string) => {
+    if (!href.startsWith('/')) return href
+
+    const separator = href.includes('?') ? '&' : '?'
+    return `${href}${separator}v=${encodeURIComponent(appVersion)}`
+  }
 
   // Check if user has visited Easy Setup
   const { data: easySetupVisited } = useSystemSetting({
-    key: 'ui.hasVisitedEasySetup'
+    key: 'ui.hasVisitedEasySetup',
+    enabled: canAccessAdminTools,
   })
   const shouldHighlightEasySetup = easySetupVisited?.value ? String(easySetupVisited.value) !== 'true' : false
 
@@ -106,8 +142,8 @@ export default function Home(props: {
       items.push({
         // Inject custom AI Assistant name if this is the chat service
         label: service.service_name === SERVICE_NAMES.OLLAMA && aiAssistantName ? aiAssistantName : (service.friendly_name || service.service_name),
-        to: service.ui_location ? getServiceLink(service.ui_location) : '#',
-        target: '_blank',
+        to: service.ui_location ? withVersionedLocalLink(getServiceLink(service.ui_location)) : '#',
+        target: service.ui_location?.startsWith('/') ? '' : '_blank',
         description:
           service.description ||
           `Access the ${service.friendly_name || service.service_name} application`,
@@ -119,6 +155,7 @@ export default function Home(props: {
         installed: service.installed,
         displayOrder: service.display_order ?? 100,
         poweredBy: service.powered_by ?? null,
+        openInNewTab: !service.ui_location?.startsWith('/'),
       })
     })
 
@@ -126,7 +163,12 @@ export default function Home(props: {
   items.push(MAPS_ITEM)
 
   // Add system items
-  items.push(...SYSTEM_ITEMS)
+  items.push(
+    ...SYSTEM_ITEMS.filter((item) => {
+      if (canAccessAdminTools) return true
+      return item.label === 'Docs' || item.label === 'Dome Planner'
+    })
+  )
 
   // Sort all items by display order
   items.sort((a, b) => a.displayOrder - b.displayOrder)
@@ -135,7 +177,7 @@ export default function Home(props: {
     <AppLayout>
       <Head title="Command Center" />
       {
-        updateInfo?.updateAvailable && (
+        canAccessAdminTools && updateInfo?.updateAvailable && (
           <div className='flex justify-center items-center p-4 w-full'>
             <Alert
               title="An update is available for Project N.O.M.A.D.!"
@@ -158,7 +200,7 @@ export default function Home(props: {
           const shouldHighlight = isEasySetup && shouldHighlightEasySetup
 
           const tileContent = (
-            <div className="relative rounded border-desert-green border-2 bg-desert-green hover:bg-transparent hover:text-text-primary text-white transition-colors shadow-sm h-48 flex flex-col items-center justify-center cursor-pointer text-center px-4">
+            <div className="relative rounded border-desert-green border-2 bg-desert-green hover:bg-transparent hover:text-text-primary text-white transition-colors shadow-sm min-h-[12rem] sm:h-48 flex flex-col items-center justify-center cursor-pointer text-center px-4 py-6">
               {shouldHighlight && (
                 <span className="absolute top-2 right-2 flex items-center justify-center">
                   <span
@@ -171,20 +213,20 @@ export default function Home(props: {
                 </span>
               )}
               <div className="flex items-center justify-center mb-2">{item.icon}</div>
-              <h3 className="font-bold text-2xl">{item.label}</h3>
+              <h3 className="font-bold text-xl sm:text-2xl">{item.label}</h3>
               {item.poweredBy && <p className="text-sm opacity-80">Powered by {item.poweredBy}</p>}
-              <p className="xl:text-lg mt-2">{item.description}</p>
+              <p className="mt-2 text-sm sm:text-base xl:text-lg">{item.description}</p>
             </div>
           )
 
-          return item.target === '_blank' ? (
+          return item.openInNewTab ? (
             <a key={item.label} href={item.to} target="_blank" rel="noopener noreferrer">
               {tileContent}
             </a>
           ) : (
-            <Link key={item.label} href={item.to}>
+            <a key={item.label} href={item.to}>
               {tileContent}
-            </Link>
+            </a>
           )
         })}
       </div>

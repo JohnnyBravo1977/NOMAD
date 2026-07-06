@@ -25,7 +25,7 @@ export class EditWorkerService {
   }
 
   async tryHandle(userText: string): Promise<string | null> {
-    const task = this.parseTask(userText)
+    const task = this.classify(userText)
     if (!task) return null
 
     switch (task.kind) {
@@ -38,6 +38,10 @@ export class EditWorkerService {
       default:
         return null
     }
+  }
+
+  classify(userText: string): EditTask | null {
+    return this.parseTask(userText)
   }
 
   private parseTask(userText: string): EditTask | null {

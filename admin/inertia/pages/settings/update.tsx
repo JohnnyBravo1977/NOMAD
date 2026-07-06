@@ -358,7 +358,11 @@ export default function SystemUpdatePage(props: { system: Props }) {
 
   const updateSettingMutation = useMutation({
     mutationFn: async ({ key, value }: { key: string; value: boolean }) => {
-      return await api.updateSetting(key, value)
+      const res = await api.updateSettingStrict(key, value)
+      if (!res?.success) {
+        throw new Error(res?.message || 'Failed to update setting')
+      }
+      return res
     },
     onSuccess: () => {
       addNotification({ message: 'Setting updated successfully.', type: 'success' })
@@ -366,7 +370,13 @@ export default function SystemUpdatePage(props: { system: Props }) {
     },
     onError: (error) => {
       console.error('Error updating setting:', error)
-      addNotification({ message: 'There was an error updating the setting. Please try again.', type: 'error' })
+      addNotification({
+        message:
+          typeof (error as any)?.response?.data?.message === 'string'
+            ? (error as any).response.data.message
+            : 'There was an error updating the setting. Please try again.',
+        type: 'error',
+      })
     },
   })
 

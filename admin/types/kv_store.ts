@@ -14,9 +14,13 @@ export const KV_STORE_SCHEMA = {
   'ai.userProfiles':            'string',
   'ai.activeUserName':          'string',
   'ai.userProfilesLastSync':    'string',
+  'ai.userProfilesMigratedToScopedMemory': 'string',
   'gpu.type':                   'string',
   'ai.remoteOllamaUrl':         'string',
   'ai.ollamaFlashAttention':    'boolean',
+  'comfy.voiceCharacters':      'string',
+  'planner.domeState':          'string',
+  'planner.aiLog':              'string',
 } as const
 
 type KVTagToType<T extends string> = T extends 'boolean' ? boolean : string

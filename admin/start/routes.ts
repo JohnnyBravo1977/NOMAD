@@ -7,8 +7,11 @@
 |
 */
 import BenchmarkController from '#controllers/benchmark_controller'
+import AuthController from '#controllers/auth_controller'
 import ChatsController from '#controllers/chats_controller'
+import ComfyUiController from '#controllers/comfyui_controller'
 import DocsController from '#controllers/docs_controller'
+import DomePlannerController from '#controllers/dome_planner_controller'
 import DownloadsController from '#controllers/downloads_controller'
 import EasySetupController from '#controllers/easy_setup_controller'
 import HomeController from '#controllers/home_controller'
@@ -18,23 +21,30 @@ import RagController from '#controllers/rag_controller'
 import SettingsController from '#controllers/settings_controller'
 import SystemController from '#controllers/system_controller'
 import CollectionUpdatesController from '#controllers/collection_updates_controller'
+import UserSpacesController from '#controllers/user_spaces_controller'
 import ZimController from '#controllers/zim_controller'
 import router from '@adonisjs/core/services/router'
 import transmit from '@adonisjs/transmit/services/main'
+import { middleware } from './kernel.js'
 
 transmit.registerRoutes()
 
 router.get('/', [HomeController, 'index'])
+router.get('/login', [AuthController, 'loginPage'])
 router.get('/home', [HomeController, 'home'])
 router.on('/about').renderInertia('about')
 router.get('/chat', [ChatsController, 'inertia'])
 router.get('/maps', [MapsController, 'index'])
+router.get('/dome-planner', [DomePlannerController, 'page'])
+router.get('/voice-settings', [ComfyUiController, 'studio']).use(middleware.adminOnly())
 router.on('/knowledge-base').redirectToPath('/chat?knowledge_base=true') // redirect for legacy knowledge-base links
 
-router.get('/easy-setup', [EasySetupController, 'index'])
-router.get('/easy-setup/complete', [EasySetupController, 'complete'])
-router.get('/api/easy-setup/curated-categories', [EasySetupController, 'listCuratedCategories'])
-router.post('/api/manifests/refresh', [EasySetupController, 'refreshManifests'])
+router.get('/easy-setup', [EasySetupController, 'index']).use(middleware.adminOnly())
+router.get('/easy-setup/complete', [EasySetupController, 'complete']).use(middleware.adminOnly())
+router
+  .get('/api/easy-setup/curated-categories', [EasySetupController, 'listCuratedCategories'])
+  .use(middleware.adminOnly())
+router.post('/api/manifests/refresh', [EasySetupController, 'refreshManifests']).use(middleware.adminOnly())
 router
   .group(() => {
     router.post('/check', [CollectionUpdatesController, 'checkForUpdates'])
@@ -42,6 +52,7 @@ router
     router.post('/apply-all', [CollectionUpdatesController, 'applyAllUpdates'])
   })
   .prefix('/api/content-updates')
+  .use(middleware.adminOnly())
 
 router
   .group(() => {
@@ -55,8 +66,10 @@ router
     router.get('/zim/remote-explorer', [SettingsController, 'zimRemote'])
     router.get('/benchmark', [SettingsController, 'benchmark'])
     router.get('/support', [SettingsController, 'support'])
+    router.get('/users', [UserSpacesController, 'settings'])
   })
   .prefix('/settings')
+  .use(middleware.adminOnly())
 
 router
   .group(() => {
@@ -107,21 +120,27 @@ router.get('/api/health', () => {
   return { status: 'ok' }
 })
 
+router.post('/api/auth/login', [AuthController, 'login'])
+router.post('/api/auth/logout', [AuthController, 'logout'])
+router.post('/api/auth/quick-create-user', [AuthController, 'quickCreateUser'])
+
 router
   .group(() => {
     router.post('/chat', [OllamaController, 'chat'])
     router.get('/models', [OllamaController, 'availableModels'])
-    router.post('/models', [OllamaController, 'dispatchModelDownload'])
-    router.delete('/models', [OllamaController, 'deleteModel'])
+    router.post('/models', [OllamaController, 'dispatchModelDownload']).use(middleware.adminOnly())
+    router.delete('/models', [OllamaController, 'deleteModel']).use(middleware.adminOnly())
     router.get('/installed-models', [OllamaController, 'installedModels'])
     router.get('/system-prompt-default', [OllamaController, 'systemPromptDefault'])
-    router.post('/configure-remote', [OllamaController, 'configureRemote'])
-    router.get('/remote-status', [OllamaController, 'remoteStatus'])
+    router.post('/configure-remote', [OllamaController, 'configureRemote']).use(middleware.adminOnly())
+    router.get('/remote-status', [OllamaController, 'remoteStatus']).use(middleware.adminOnly())
   })
   .prefix('/api/ollama')
 
 router
   .group(() => {
+    router.post('/attachments', [ChatsController, 'uploadAttachment'])
+    router.get('/attachments/view/:token', [ChatsController, 'viewAttachment'])
     router.get('/', [ChatsController, 'index'])
     router.post('/', [ChatsController, 'store'])
     router.delete('/all', [ChatsController, 'destroyAll'])
@@ -133,6 +152,26 @@ router
   .prefix('/api/chat/sessions')
 
 router.get('/api/chat/suggestions', [ChatsController, 'suggestions'])
+
+router
+  .group(() => {
+    router.get('/', [DomePlannerController, 'show'])
+    router.put('/', [DomePlannerController, 'saveState'])
+    router.post('/log', [DomePlannerController, 'addLogEntry'])
+  })
+  .prefix('/api/dome-planner')
+
+router
+  .group(() => {
+    router.get('/voices', [ComfyUiController, 'voices'])
+    router.get('/tts/status', [ComfyUiController, 'ttsStatus'])
+    router.post('/tts/speak', [ComfyUiController, 'speak'])
+    router.post('/tts/stream', [ComfyUiController, 'speakStream'])
+    router.post('/voices', [ComfyUiController, 'saveVoice']).use(middleware.adminOnly())
+    router.post('/voices/clone', [ComfyUiController, 'saveClonedVoice']).use(middleware.adminOnly())
+    router.delete('/voices/:id', [ComfyUiController, 'deleteVoice']).use(middleware.adminOnly())
+  })
+  .prefix('/api/comfyui')
 
 router
   .group(() => {
@@ -168,6 +207,7 @@ router
     router.patch('/settings', [SettingsController, 'updateSetting'])
   })
   .prefix('/api/system')
+  .use(middleware.adminOnly())
 
 router
   .group(() => {
@@ -182,6 +222,17 @@ router
     router.delete('/:filename', [ZimController, 'delete'])
   })
   .prefix('/api/zim')
+
+router
+  .group(() => {
+    router.get('/context', [UserSpacesController, 'context'])
+    router.post('/select', [UserSpacesController, 'select'])
+    router.get('/', [UserSpacesController, 'index']).use(middleware.adminOnly())
+    router.post('/', [UserSpacesController, 'store']).use(middleware.adminOnly())
+    router.patch('/family/settings', [UserSpacesController, 'updateFamily']).use(middleware.adminOnly())
+    router.patch('/:id', [UserSpacesController, 'update']).use(middleware.adminOnly())
+  })
+  .prefix('/api/users')
 
 router
   .group(() => {

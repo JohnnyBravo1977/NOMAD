@@ -10,17 +10,17 @@ export default function BouncingDots({ text, containerClassName, textClassName }
   return (
     <div className={clsx("flex items-center justify-center gap-2", containerClassName)}>
       <span className={clsx("text-text-secondary", textClassName)}>{text}</span>
-      <span className="flex gap-1 mt-1">
+      <span className="mt-0.5 flex gap-1">
         <span
-          className="w-1.5 h-1.5 bg-text-secondary rounded-full animate-bounce"
+          className="h-1 w-1 animate-bounce rounded-full bg-text-secondary"
           style={{ animationDelay: '0ms' }}
         />
         <span
-          className="w-1.5 h-1.5 bg-text-secondary rounded-full animate-bounce"
+          className="h-1 w-1 animate-bounce rounded-full bg-text-secondary"
           style={{ animationDelay: '150ms' }}
         />
         <span
-          className="w-1.5 h-1.5 bg-text-secondary rounded-full animate-bounce"
+          className="h-1 w-1 animate-bounce rounded-full bg-text-secondary"
           style={{ animationDelay: '300ms' }}
         />
       </span>

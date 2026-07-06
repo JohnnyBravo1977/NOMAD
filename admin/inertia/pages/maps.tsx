@@ -20,19 +20,19 @@ export default function Maps(props: {
       <Head title="Maps" />
       <div className="relative w-full h-screen overflow-hidden">
         {/* Nav and alerts are overlayed */}
-        <div className="absolute top-0 left-0 right-0 z-50 flex justify-between p-4 bg-surface-secondary backdrop-blur-sm shadow-sm">
+        <div className="absolute top-0 left-0 right-0 z-50 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between p-3 sm:p-4 bg-surface-secondary/95 backdrop-blur-sm shadow-sm">
           <Link href="/home" className="flex items-center">
-            <IconArrowLeft className="mr-2" size={24} />
-            <p className="text-lg text-text-secondary">Back to Home</p>
+            <IconArrowLeft className="mr-2" size={20} />
+            <p className="text-sm sm:text-lg text-text-secondary">Back to Home</p>
           </Link>
-          <Link href="/settings/maps" className='mr-4'>
+          <Link href="/settings/maps" className="sm:mr-4">
             <StyledButton variant="primary" icon="IconSettings">
               Manage Map Regions
             </StyledButton>
           </Link>
         </div>
         {alertMessage && (
-          <div className="absolute top-20 left-4 right-4 z-50">
+          <div className="absolute top-28 sm:top-20 left-3 right-3 sm:left-4 sm:right-4 z-50">
             <Alert
               title={alertMessage}
               type="warning"

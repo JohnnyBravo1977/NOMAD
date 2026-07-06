@@ -1,5 +1,6 @@
 import app from '@adonisjs/core/services/app'
 import { HttpContext, ExceptionHandler } from '@adonisjs/core/http'
+import logger from '@adonisjs/core/services/logger'
 import type { StatusPageRange, StatusPageRenderer } from '@adonisjs/core/types/http'
 
 export default class HttpExceptionHandler extends ExceptionHandler {
@@ -40,6 +41,8 @@ export default class HttpExceptionHandler extends ExceptionHandler {
    * @note You should not attempt to send a response from this method.
    */
   async report(error: unknown, ctx: HttpContext) {
+    const message = error instanceof Error ? `${error.name}: ${error.message}\n${error.stack || ''}` : String(error)
+    logger.error(`[HttpExceptionHandler] ${ctx.request.method()} ${ctx.request.url()} failed\n${message}`)
     return super.report(error, ctx)
   }
 }

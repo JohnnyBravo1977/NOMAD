@@ -7,6 +7,7 @@ export interface StyledButtonProps extends React.HTMLAttributes<HTMLButtonElemen
   children: React.ReactNode
   icon?: DynamicIconName
   disabled?: boolean
+  type?: 'button' | 'submit' | 'reset'
   variant?: 'primary' | 'secondary' | 'danger' | 'action' | 'success' | 'ghost' | 'outline'
   size?: 'sm' | 'md' | 'lg'
   loading?: boolean
@@ -147,7 +148,7 @@ const StyledButton: React.FC<StyledButtonProps> = ({
 
   return (
     <button
-      type="button"
+      type={props.type || 'button'}
       className={clsx(
         fullWidth ? 'flex w-full' : 'inline-flex',
         getSizeClasses(),

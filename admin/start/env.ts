@@ -11,6 +11,20 @@
 
 import { Env } from '@adonisjs/core/env'
 
+if (process.env.NODE_ENV === 'test') {
+  process.env.PORT ??= '3333'
+  process.env.APP_KEY ??= 'test-app-key-1234567890'
+  process.env.HOST ??= '127.0.0.1'
+  process.env.URL ??= 'http://127.0.0.1:3333'
+  process.env.LOG_LEVEL ??= 'silent'
+  process.env.DB_HOST ??= '127.0.0.1'
+  process.env.DB_PORT ??= '3306'
+  process.env.DB_USER ??= 'nomad_test'
+  process.env.DB_DATABASE ??= 'nomad_test'
+  process.env.REDIS_HOST ??= '127.0.0.1'
+  process.env.REDIS_PORT ??= '6379'
+}
+
 export default await Env.create(new URL('../', import.meta.url), {
   NODE_ENV: Env.schema.enum(['development', 'production', 'test'] as const),
   PORT: Env.schema.number(),
@@ -73,6 +87,7 @@ export default await Env.create(new URL('../', import.meta.url), {
   NOMAD_DISABLE_RAG: Env.schema.boolean.optional(),
   NOMAD_RAG_MIN_SCORE: Env.schema.number.optional(),
   NOMAD_RAG_MIN_CHARS: Env.schema.number.optional(),
+  NOMAD_HERMES_ROUTER_MODEL: Env.schema.string.optional(),
   NOMAD_OLLAMA_KV_CACHE_TYPE: Env.schema.string.optional(),
   NOMAD_OLLAMA_MAX_QUEUE: Env.schema.string.optional(),
   NOMAD_TIMEZONE: Env.schema.string.optional(),
